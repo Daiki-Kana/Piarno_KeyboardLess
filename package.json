@@ -1,0 +1,20 @@
+{
+  "name": "piarno-keyboardless",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "^0.10.18"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-basic-ssl": "^2.3.0",
+    "typescript": "^5.7.3",
+    "vite": "^6.2.0",
+    "vite-plugin-qrcode": "^0.4.1"
+  }
+}

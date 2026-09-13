@@ -1,0 +1,136 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background-color: #000000;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.camera-container {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: #000000;
+}
+
+/* 鏡像（左右反転）のフルスクリーン配置 */
+#webcam, #output-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1);
+}
+
+#output-canvas {
+  pointer-events: none;
+}
+
+/* 縦画面時の横向き案内 */
+.portrait-warning {
+  display: none;
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: #000000;
+  color: #ffffff;
+  z-index: 9999;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 32px;
+}
+
+@media screen and (orientation: portrait) {
+  .portrait-warning {
+    display: flex;
+  }
+}
+
+/* 起動用ミニマルオーバーレイ */
+.overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.88);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+  transition: opacity 0.3s ease, background 0.3s ease;
+}
+
+/* カメラ開始後・構え確認用プレビュー時（手を机に置いて確認できる半透明） */
+.overlay.preview {
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.overlay.hidden {
+  opacity: 0;
+  pointer-events: none;
+  display: none;
+}
+
+.minimal-btn {
+  background: #ffffff;
+  color: #000000;
+  border: none;
+  padding: 14px 32px;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  border-radius: 6px;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition: transform 0.1s ease, opacity 0.2s ease;
+}
+
+.minimal-btn:active {
+  transform: scale(0.96);
+}
+
+.minimal-btn:disabled {
+  background: #222222;
+  color: #777777;
+  cursor: not-allowed;
+}
+
+/* カウントダウン表示（白黒ミニマル） */
+.countdown-text {
+  display: none;
+  font-size: 76px;
+  font-weight: 800;
+  color: #ffffff;
+  letter-spacing: 2px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+  text-align: center;
+  user-select: none;
+}
+
+.countdown-text.show {
+  display: block;
+}

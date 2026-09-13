@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <title>Piarno</title>
+    <link rel="stylesheet" href="./src/style.css" />
+  </head>
+  <body>
+    <!-- 縦画面時の横向き案内 -->
+    <div id="portrait-warning" class="portrait-warning">
+      <span>画面を横向きにしてください</span>
+    </div>
+
+    <div class="camera-container">
+      <video id="webcam" autoplay playsinline webkit-playsinline muted></video>
+      <canvas id="output-canvas"></canvas>
+
+      <!-- 起動・カウントダウン用ミニマルオーバーレイ -->
+      <div id="start-overlay" class="overlay">
+        <button id="camera-btn" class="minimal-btn" disabled>初期化中...</button>
+        <button id="countdown-btn" class="minimal-btn" style="display: none;">スタート</button>
+        <div id="countdown-display" class="countdown-text"></div>
+      </div>
+    </div>
+
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>
