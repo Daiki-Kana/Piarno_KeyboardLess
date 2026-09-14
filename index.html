@@ -18,6 +18,24 @@
       <video id="webcam" autoplay playsinline webkit-playsinline muted></video>
       <canvas id="output-canvas"></canvas>
 
+      <!-- 横画面セーフエリア対応 白黒ミニマルデバッグHUD -->
+      <div id="debug-hud" class="debug-hud">
+        <div class="hud-row"><span class="hud-label">PERM   :</span> <span id="hud-perm">pending</span></div>
+        <div class="hud-row"><span class="hud-label">CALIB  :</span> <span id="hud-calib">Fallback</span></div>
+        <div class="hud-row"><span class="hud-label">PITCH  :</span> <span id="hud-pitch">--</span></div>
+        <div class="hud-row"><span class="hud-label">STATE  :</span> <span id="hud-state">AIRBORNE</span></div>
+        <div class="hud-row"><span class="hud-label">TIP Y  :</span> <span id="hud-tip-y">--</span></div>
+        <div class="hud-row hud-rope-row">
+          <div><span class="hud-label">ROPE Y :</span> <span id="hud-rope-y">0.750</span></div>
+          <div class="hud-buttons">
+            <button id="hud-btn-up" class="hud-ctrl-btn" title="ロープを上げる">▲</button>
+            <button id="hud-btn-down" class="hud-ctrl-btn" title="ロープを下げる">▼</button>
+          </div>
+        </div>
+        <div class="hud-row"><span class="hud-label">DIFF   :</span> <span id="hud-diff">--</span></div>
+        <div class="hud-row hud-target-row"><span class="hud-label">TARGET :</span> <span id="hud-target">--</span></div>
+      </div>
+
       <!-- 起動・カウントダウン用ミニマルオーバーレイ -->
       <div id="start-overlay" class="overlay">
         <button id="camera-btn" class="minimal-btn" disabled>初期化中...</button>

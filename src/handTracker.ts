@@ -53,9 +53,9 @@ export class HandTracker {
         },
         runningMode: 'VIDEO',
         numHands: 2,
-        minHandDetectionConfidence: 0.6,
-        minHandPresenceConfidence: 0.6,
-        minTrackingConfidence: 0.6,
+        minHandDetectionConfidence: 0.5,
+        minHandPresenceConfidence: 0.4,
+        minTrackingConfidence: 0.4,
       });
       this.activeDelegate = 'GPU';
     } catch (gpuError) {
@@ -67,15 +67,18 @@ export class HandTracker {
         },
         runningMode: 'VIDEO',
         numHands: 2,
-        minHandDetectionConfidence: 0.6,
-        minHandPresenceConfidence: 0.6,
-        minTrackingConfidence: 0.6,
+        minHandDetectionConfidence: 0.5,
+        minHandPresenceConfidence: 0.4,
+        minTrackingConfidence: 0.4,
       });
       this.activeDelegate = 'CPU';
     }
 
     this.isInitialized = true;
   }
+
+  // 片手検出時の左右反転チラつき防止用ヒステリシス状態
+  private lastSingleHandedness: 'Left' | 'Right' | null = null;
 
   /**
    * ビデオフレームから両手の指先座標を検出
@@ -146,10 +149,22 @@ export class HandTracker {
 
       hands.push(assignHandedness(candidates[0], 'Left'));
       hands.push(assignHandedness(candidates[1], 'Right'));
+      this.lastSingleHandedness = null;
     } else {
-      // 1本の手のみ検出されている場合: 画面中央(0.46)を境に判定
+      // 1本の手のみ検出されている場合: 境界ヒステリシスで左右反転フリップを防止
       candidates.forEach((cand) => {
-        const handedness: 'Left' | 'Right' = cand.centerX > 0.46 ? 'Left' : 'Right';
+        let handedness: 'Left' | 'Right';
+        if (this.lastSingleHandedness === 'Left') {
+          // 左手状態から右手へ切り替えるには明確に右側 (x < 0.38) へ移動する必要がある
+          handedness = cand.centerX < 0.38 ? 'Right' : 'Left';
+        } else if (this.lastSingleHandedness === 'Right') {
+          // 右手状態から左手へ切り替えるには明確に左側 (x > 0.54) へ移動する必要がある
+          handedness = cand.centerX > 0.54 ? 'Left' : 'Right';
+        } else {
+          handedness = cand.centerX > 0.46 ? 'Left' : 'Right';
+        }
+        this.lastSingleHandedness = handedness;
+
         const fingertips: FingertipCoord[] = FINGERTIP_INDICES.map((tip) => {
           const point = cand.landmarks[tip.index];
           return {

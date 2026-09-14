@@ -1,15 +1,23 @@
 /**
- * 指先の垂直方向減速ピークによる机タップ（打鍵）検知エンジン
+ * 机上「仮想ロープ（水平境界線）」接触による打鍵検知エンジン
+ * 画面正規化Y座標系における境界交差と2値ヒステリシスステートマシン、
+ * 指数平滑化（EMA）と異常値ガードによりジッターのない極めて堅牢な打鍵判定を実現する。
  */
 
+export type RopeState = 'AIRBORNE' | 'TOUCHED';
+
 export interface TapDetectorConfig {
-  /** 能動的振り下ろしとみなす最小垂直速度 (正規化座標/s, デフォルト: 0.45) */
-  minDownVelocity?: number;
-  /** 机衝突時の急減速加速度ピーク閾値 (/s², 負値, デフォルト: -14.0) */
-  minDecelPeak?: number;
-  /** 振り下ろし開始から着地インパクトまでの許容時間窓 (ms, デフォルト: 140) */
-  maxDownToImpactMs?: number;
-  /** 打鍵後の不応期 (ms, チャタリング防止, デフォルト: 150) */
+  /** 仮想ロープの高さ (正規化Y座標: 0.0 ~ 1.0, 画面上端0.0、下端1.0, デフォルト: 0.75) */
+  ropeY?: number;
+  /** 指先判定サイズ・厚み半径 (正規化Y座標, デフォルト: 0.025。ロープ手前から接触とみなすマージン) */
+  fingerRadius?: number;
+  /** 浮上（AIRBORNE）復帰判定マージン (正規化Y座標, デフォルト: 0.03) */
+  releaseMargin?: number;
+  /** 指先Y座標の指数平滑化係数 (0.0 ~ 1.0, デフォルト: 0.4) */
+  smoothingAlpha?: number;
+  /** 1フレームあたりの最大許容移動量（異常値ガード, デフォルト: 0.08） */
+  maxJumpPerFrame?: number;
+  /** 打鍵後の最小不応期 (ms, デフォルト: 80) */
   cooldownMs?: number;
 }
 
@@ -26,36 +34,80 @@ export interface TapEvent {
   timestamp: number;
 }
 
+export interface DebugRopeInfo {
+  state: RopeState;
+  yTip: number;
+  ropeY: number;
+  diff: number; // yTip - ropeY
+}
+
 interface FingerState {
+  state: RopeState;
   lastTime: number;
-  lastY: number;
-  lastVy: number;
-  /** 直近の能動的振り下ろし発生時刻 */
-  lastActiveDownTime: number;
-  /** その振り下ろし中の最大下向き速度 */
-  maxActiveDownVy: number;
-  /** 最終打鍵検知時刻 */
+  smoothedY: number;
   lastTapTime: number;
 }
 
 export class TapDetector {
-  private minDownVelocity: number;
-  private minDecelPeak: number;
-  private maxDownToImpactMs: number;
+  private ropeY: number;
+  private fingerRadius: number;
+  private releaseMargin: number;
+  private smoothingAlpha: number;
+  private maxJumpPerFrame: number;
   private cooldownMs: number;
   private fingerStates = new Map<string, FingerState>();
 
   constructor(config: TapDetectorConfig = {}) {
-    this.minDownVelocity = config.minDownVelocity ?? 0.30;
-    this.minDecelPeak = config.minDecelPeak ?? -7.0;
-    this.maxDownToImpactMs = config.maxDownToImpactMs ?? 220;
-    this.cooldownMs = config.cooldownMs ?? 130;
+    this.ropeY = config.ropeY ?? 0.75;
+    this.fingerRadius = config.fingerRadius ?? 0.025;
+    this.releaseMargin = config.releaseMargin ?? 0.03;
+    this.smoothingAlpha = config.smoothingAlpha ?? 0.4;
+    this.maxJumpPerFrame = config.maxJumpPerFrame ?? 0.08;
+    this.cooldownMs = config.cooldownMs ?? 80;
+  }
+
+  public getRopeY(): number {
+    return this.ropeY;
+  }
+
+  public setRopeY(y: number): void {
+    // 0.30 ~ 0.90 の画面安全範囲内にクランプ
+    this.ropeY = Math.max(0.30, Math.min(0.90, y));
+  }
+
+  public getFingerRadius(): number {
+    return this.fingerRadius;
+  }
+
+  public setFingerRadius(radius: number): void {
+    this.fingerRadius = Math.max(0.0, Math.min(0.1, radius));
+  }
+
+  public getReleaseMargin(): number {
+    return this.releaseMargin;
   }
 
   /**
-   * 単一の指先座標を評価し、能動的振り下ろし＋机衝突の急減速が成立した場合に TapEvent を返す
+   * 指定した指の現在のデバッグ情報（ステート、平滑化後指先Y、ロープY、差分）を取得
    */
-  processFingertip(
+  public getDebugInfo(handedness: 'Left' | 'Right', tipIndex: number): DebugRopeInfo | null {
+    const key = `${handedness}_${tipIndex}`;
+    const state = this.fingerStates.get(key);
+    if (!state) return null;
+
+    const contactY = this.ropeY - this.fingerRadius;
+    return {
+      state: state.state,
+      yTip: state.smoothedY,
+      ropeY: this.ropeY,
+      diff: state.smoothedY - contactY,
+    };
+  }
+
+  /**
+   * 単一指先の正規化Y座標を評価し、指数平滑化＋ヒステリシスステートマシンに基づいて打鍵イベントを返す
+   */
+  public processFingertip(
     handedness: 'Left' | 'Right',
     tipIndex: number,
     name: string,
@@ -67,99 +119,84 @@ export class TapDetector {
     const key = `${handedness}_${tipIndex}`;
     let state = this.fingerStates.get(key);
 
-    // 親指(4)、小指(20)、薬指(16)は独立した垂直可動域が小さく力が出にくいため、感度を専用ブースト
-    const isWeakFinger = tipIndex === 4 || tipIndex === 20 || tipIndex === 16;
-    const effectiveMinDownVelocity = isWeakFinger ? this.minDownVelocity * 0.40 : this.minDownVelocity;
-    const effectiveMinDecelPeak = isWeakFinger ? this.minDecelPeak * 0.40 : this.minDecelPeak;
-    const effectiveAyThreshold = isWeakFinger ? -3.0 : -6.0;
+    // 0.0 ~ 1.0 の安全範囲にクランプ
+    const clampedY = Math.max(0.0, Math.min(1.0, y));
+
+    // 指先の厚み・半径を考慮した有効接触閾値 (ロープの手前 fingerRadius から接触と判定)
+    const contactThresholdY = this.ropeY - this.fingerRadius;
 
     if (!state) {
+      // 初回検出時: 指がすでにロープ付近にある場合の暴発を防ぐため初期状態を設定
+      const isAboveRope = clampedY < contactThresholdY - this.releaseMargin;
       state = {
+        state: isAboveRope ? 'AIRBORNE' : 'TOUCHED',
         lastTime: timestamp,
-        lastY: y,
-        lastVy: 0,
-        lastActiveDownTime: -9999,
-        maxActiveDownVy: 0,
+        smoothedY: clampedY,
         lastTapTime: -9999,
       };
       this.fingerStates.set(key, state);
       return null;
     }
 
-    const dt = (timestamp - state.lastTime) / 1000.0; // 秒単位
+    const dt = (timestamp - state.lastTime) / 1000.0;
 
-    // タイムスタンプ異常または長時間追跡中断時はリセット
-    if (dt <= 0.001 || dt > 0.3) {
+    // ランドマーク未検出（フレーム落ち）や長時間中断時のガード: EMA履歴をリセット
+    if (dt > 0.25 || dt <= 0.0) {
       state.lastTime = timestamp;
-      state.lastY = y;
-      state.lastVy = 0;
-      state.lastActiveDownTime = -9999;
-      state.maxActiveDownVy = 0;
+      state.smoothedY = clampedY;
       return null;
     }
 
-    // 垂直方向速度 (下向き移動を正とする)
-    const vy = (y - state.lastY) / dt;
-    // 垂直方向加速度 (下向き加速が正、急減速・衝突が負の急峻ピーク)
-    const ay = (vy - state.lastVy) / dt;
+    // 異常値ガード: 1フレームで過剰に跳ねた場合は変化量をクランプ
+    let guardedY = clampedY;
+    const rawDeltaY = clampedY - state.smoothedY;
+    if (Math.abs(rawDeltaY) > this.maxJumpPerFrame) {
+      guardedY = state.smoothedY + Math.sign(rawDeltaY) * this.maxJumpPerFrame;
+    }
 
+    // 指数平滑化 (EMA / ローパスフィルタ)
+    const prevSmoothedY = state.smoothedY;
+    const currentSmoothedY = this.smoothingAlpha * guardedY + (1.0 - this.smoothingAlpha) * prevSmoothedY;
+
+    // 下降速度 (正規化Y / 秒)
+    const downVy = (currentSmoothedY - prevSmoothedY) / Math.max(0.001, dt);
+
+    let tapEvent: TapEvent | null = null;
     const timeSinceLastTap = timestamp - state.lastTapTime;
     const isCoolingDown = timeSinceLastTap < this.cooldownMs;
 
-    // 段階1: 明確な能動的振り下ろし（アクティブダウン）の検知と記憶
-    if (vy >= effectiveMinDownVelocity) {
-      state.lastActiveDownTime = timestamp;
-      state.maxActiveDownVy = Math.max(state.maxActiveDownVy, vy);
-    }
+    if (state.state === 'AIRBORNE') {
+      // 浮上中から指判定領域 (y >= ropeY - fingerRadius) に接触・交差した瞬間に打鍵判定
+      if (currentSmoothedY >= contactThresholdY) {
+        state.state = 'TOUCHED';
+        if (!isCoolingDown) {
+          // 下向き速度に応じたベロシティ計算 (0.35 ~ 1.0)
+          const normalizedSpeed = Math.max(0, downVy);
+          const velocity = Math.min(1.0, Math.max(0.35, normalizedSpeed / 1.0));
 
-    let tapEvent: TapEvent | null = null;
-
-    if (!isCoolingDown) {
-      // 直近 (maxDownToImpactMs 以内) に十分なスピードの振り下ろしが発生しているか
-      const hasRecentActiveDown =
-        timestamp - state.lastActiveDownTime <= this.maxDownToImpactMs &&
-        state.maxActiveDownVy >= effectiveMinDownVelocity;
-
-      // 段階2: 机衝突による物理的急減速（負の急峻な加速度ピーク または 強い制動）
-      const hasDecelPeak = ay <= effectiveMinDecelPeak;
-      const hasSharpVelocityDrop =
-        state.lastVy >= effectiveMinDownVelocity &&
-        vy <= state.lastVy * 0.40 &&
-        ay <= effectiveAyThreshold;
-
-      if (hasRecentActiveDown && (hasDecelPeak || hasSharpVelocityDrop)) {
-        // 振り下ろしピーク速度を元にベロシティ (0.2 ~ 1.0) を算出
-        const impactSpeed = Math.max(state.lastVy, state.maxActiveDownVy);
-        const velocity = Math.min(1.0, Math.max(0.2, impactSpeed / (isWeakFinger ? 1.0 : 1.6)));
-
-        tapEvent = {
-          handedness,
-          tipIndex,
-          name,
-          x,
-          y,
-          z,
-          velocity,
-          timestamp,
-        };
-
-        // 打鍵成立: 状態更新とクールダウン突入
-        state.lastTapTime = timestamp;
-        state.lastActiveDownTime = -9999;
-        state.maxActiveDownVy = 0;
+          tapEvent = {
+            handedness,
+            tipIndex,
+            name,
+            x,
+            y: currentSmoothedY,
+            z,
+            velocity,
+            timestamp,
+          };
+          state.lastTapTime = timestamp;
+        }
       }
-    }
-
-    // 指が上向きに引き上げられた場合は振り下ろし状態をクリア
-    if (vy < -0.15) {
-      state.lastActiveDownTime = -9999;
-      state.maxActiveDownVy = 0;
+    } else {
+      // 接触中 (TOUCHED): 指先が判定領域上方 (contactThresholdY - releaseMargin) に持ち上がるまで再発火をロック
+      if (currentSmoothedY < contactThresholdY - this.releaseMargin) {
+        state.state = 'AIRBORNE';
+      }
     }
 
     // 状態更新
     state.lastTime = timestamp;
-    state.lastY = y;
-    state.lastVy = vy;
+    state.smoothedY = currentSmoothedY;
 
     return tapEvent;
   }
@@ -167,7 +204,7 @@ export class TapDetector {
   /**
    * トラッキング中断時などの状態全リセット
    */
-  reset(): void {
+  public reset(): void {
     this.fingerStates.clear();
   }
 }

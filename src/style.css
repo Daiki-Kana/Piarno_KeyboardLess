@@ -134,3 +134,110 @@ html, body {
 .countdown-text.show {
   display: block;
 }
+
+/* 横画面セーフエリア対応 白黒ミニマルデバッグHUD */
+.debug-hud {
+  position: absolute;
+  top: max(14px, env(safe-area-inset-top, 14px));
+  left: max(16px, env(safe-area-inset-left, 16px));
+  z-index: 30;
+  width: 236px;
+  background: rgba(0, 0, 0, 0.82);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  padding: 10px 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #ffffff;
+  pointer-events: auto;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.hud-row {
+  display: flex;
+  align-items: center;
+  margin-bottom: 2px;
+  white-space: nowrap;
+}
+
+.hud-label {
+  color: #aaaaaa;
+  width: 72px;
+  flex-shrink: 0;
+}
+
+.hud-rope-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.hud-buttons {
+  display: flex;
+  gap: 4px;
+}
+
+.hud-ctrl-btn {
+  background: #222222;
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  width: 24px;
+  height: 18px;
+  font-size: 10px;
+  font-weight: bold;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  padding: 0;
+}
+
+.hud-ctrl-btn:active {
+  background: #ffffff;
+  color: #000000;
+}
+
+.hud-target-row {
+  color: #888888;
+  margin-bottom: 0;
+}
+
+.hud-status-calibrated {
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.hud-status-fallback {
+  color: #888888;
+}
+
+.hud-state-touched {
+  color: #ffffff;
+  font-weight: bold;
+}
+
+.hud-state-airborne {
+  color: #aaaaaa;
+}
+
+.hud-perm-granted {
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.hud-perm-denied {
+  color: #888888;
+}
+
+.hud-perm-pending {
+  color: #aaaaaa;
+}
+
+.hud-perm-unsupported {
+  color: #666666;
+}
+
+
