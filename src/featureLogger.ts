@@ -1,25 +1,45 @@
 import { HandData } from './handTracker';
 
-export interface LoggedFrame {
+export interface RecordedFrame {
   timestamp: number;
   features: [number, number, number, number, number, number]; // [rx, ry, rz, vx, vy, vz]
   label: number; // 1: HIT, 0: 通常
+  imageBitmap?: ImageBitmap;
+  hands?: HandData[]; // レビュー描画用の骨格ランドマーク
+}
+
+export interface FeatureLoggerStatus {
+  frameCount: number;
+  hitCount: number;
+  isRecording: boolean;
+  isTracked: boolean;
+  targetHand: string;
 }
 
 export class FeatureLogger {
   private isRecording = false;
   private isHitActive = false;
-  private recordedFrames: LoggedFrame[] = [];
+  private recordedFrames: RecordedFrame[] = [];
   private hitCount = 0;
 
   private lastR: { x: number; y: number; z: number } | null = null;
   private lastTimestamp: number | null = null;
 
-  // UI コールバック
-  private onStatusUpdate?: (status: { frameCount: number; hitCount: number; isRecording: boolean; isTracked: boolean; targetHand: string }) => void;
+  // キャプチャ用オフスクリーンCanvas（メモリ効率と高速描画のため640px幅に最適化）
+  private captureCanvas: HTMLCanvasElement | null = null;
+  private captureCtx: CanvasRenderingContext2D | null = null;
+  private readonly CAPTURE_WIDTH = 640;
 
-  constructor(onStatusUpdate?: (status: { frameCount: number; hitCount: number; isRecording: boolean; isTracked: boolean; targetHand: string }) => void) {
+  // UI コールバック
+  private onStatusUpdate?: (status: FeatureLoggerStatus) => void;
+  private onRecordingStopped?: (frames: RecordedFrame[]) => void;
+
+  constructor(
+    onStatusUpdate?: (status: FeatureLoggerStatus) => void,
+    onRecordingStopped?: (frames: RecordedFrame[]) => void
+  ) {
     this.onStatusUpdate = onStatusUpdate;
+    this.onRecordingStopped = onRecordingStopped;
   }
 
   public get recording(): boolean {
@@ -32,6 +52,10 @@ export class FeatureLogger {
 
   public get hits(): number {
     return this.hitCount;
+  }
+
+  public get frames(): RecordedFrame[] {
+    return this.recordedFrames;
   }
 
   /**
@@ -47,6 +71,9 @@ export class FeatureLogger {
   }
 
   public startRecording(): void {
+    // 既存のImageBitmapがあればメモリ解放
+    this.clearRecordedBitmaps();
+
     this.isRecording = true;
     this.recordedFrames = [];
     this.hitCount = 0;
@@ -56,10 +83,15 @@ export class FeatureLogger {
   }
 
   public stopRecording(): void {
+    if (!this.isRecording) return;
     this.isRecording = false;
     this.lastR = null;
     this.lastTimestamp = null;
     this.notifyStatus(false, 'None');
+
+    if (this.onRecordingStopped) {
+      this.onRecordingStopped(this.recordedFrames);
+    }
   }
 
   /**
@@ -75,10 +107,40 @@ export class FeatureLogger {
   }
 
   /**
-   * フレーム毎の特徴量算出および記録処理
-   * RECがオフの場合はメモリアロケーションを一切行わず即座に復帰
+   * 指定インデックスのフレームの打鍵ラベルをトグル
    */
-  public processFrame(hands: HandData[], timestamp: number): void {
+  public toggleFrameLabel(index: number): number {
+    if (index < 0 || index >= this.recordedFrames.length) return 0;
+    const current = this.recordedFrames[index].label;
+    const next = current === 1 ? 0 : 1;
+    this.recordedFrames[index].label = next;
+
+    // マークされた総数を再計算
+    this.hitCount = this.recordedFrames.filter((f) => f.label === 1).length;
+    return next;
+  }
+
+  /**
+   * 指定インデックスのフレームの打鍵ラベルを直接設定
+   */
+  public setFrameLabel(index: number, label: number): void {
+    if (index < 0 || index >= this.recordedFrames.length) return;
+    this.recordedFrames[index].label = label;
+    this.hitCount = this.recordedFrames.filter((f) => f.label === 1).length;
+  }
+
+  /**
+   * フレーム毎の特徴量算出および映像・骨格の記録処理
+   * RECがオフの場合はメモリアロケーションを一切行わず即座に復帰
+   * @param hands smoothHandFingertips で平滑化された HandData 配列
+   * @param timestamp performance.now() タイムスタンプ
+   * @param videoElement カメラ映像キャプチャ元の HTMLVideoElement
+   */
+  public processFrame(
+    hands: HandData[],
+    timestamp: number,
+    videoElement?: HTMLVideoElement
+  ): void {
     if (!this.isRecording) {
       return;
     }
@@ -128,27 +190,116 @@ export class FeatureLogger {
 
     const label = this.isHitActive ? 1 : 0;
 
-    this.recordedFrames.push({
+    // フレームオブジェクトを作成
+    const frameData: RecordedFrame = {
       timestamp,
       features: [rx, ry, rz, vx, vy, vz],
       label,
-    });
+      hands: this.cloneHands(hands),
+    };
 
+    // 映像フレームを軽量Bitmapとしてキャプチャ
+    if (videoElement && videoElement.videoWidth > 0) {
+      this.captureVideoFrame(videoElement).then((bmp) => {
+        frameData.imageBitmap = bmp;
+      }).catch((err) => {
+        console.warn('[FeatureLogger] フレーム画像キャプチャ失敗:', err);
+      });
+    }
+
+    this.recordedFrames.push(frameData);
     this.notifyStatus(true, targetHand.handedness);
   }
 
   /**
-   * 記録したフレームデータをJSONファイルとしてダウンロード
+   * メモリ効率化のため映像を縮小Canvasに描画してImageBitmap化
+   */
+  private async captureVideoFrame(video: HTMLVideoElement): Promise<ImageBitmap> {
+    const aspect = video.videoHeight / (video.videoWidth || 1);
+    const targetW = this.CAPTURE_WIDTH;
+    const targetH = Math.round(targetW * aspect);
+
+    if (!this.captureCanvas) {
+      this.captureCanvas = document.createElement('canvas');
+    }
+    if (this.captureCanvas.width !== targetW || this.captureCanvas.height !== targetH) {
+      this.captureCanvas.width = targetW;
+      this.captureCanvas.height = targetH;
+      this.captureCtx = this.captureCanvas.getContext('2d');
+    }
+
+    if (this.captureCtx) {
+      this.captureCtx.drawImage(video, 0, 0, targetW, targetH);
+      return createImageBitmap(this.captureCanvas);
+    } else {
+      return createImageBitmap(video);
+    }
+  }
+
+  /**
+   * 骨格データのディープコピー（参照共有による後続フレームでの値書き換わりを防止）
+   */
+  private cloneHands(hands: HandData[]): HandData[] {
+    return hands.map((h) => ({
+      handedness: h.handedness,
+      score: h.score,
+      centerX: h.centerX,
+      fingertips: h.fingertips.map((f) => ({ ...f })),
+      allLandmarks: h.allLandmarks.map((l) => ({ ...l })),
+    }));
+  }
+
+  /**
+   * 保持しているすべてのImageBitmapを閉じてメモリを解放
+   */
+  public clearRecordedBitmaps(): void {
+    for (const fr of this.recordedFrames) {
+      if (fr.imageBitmap) {
+        fr.imageBitmap.close();
+      }
+    }
+    this.recordedFrames = [];
+  }
+
+  /**
+   * 記録したフレームデータを既存の1D-TCN学習スクリプト互換のJSONファイルとしてダウンロード
    */
   public exportJSON(): void {
     if (this.recordedFrames.length === 0) {
       return;
     }
 
-    const jsonStr = JSON.stringify(this.recordedFrames, null, 2);
-    const blob = new Blob([jsonStr], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
+    // 学習パイプライン（train_1d_tcn.py）が期待するデータ構造のみ抽出
+    const exportData = this.recordedFrames.map((f) => ({
+      timestamp: f.timestamp,
+      features: f.features,
+      label: f.label,
+    }));
 
+    const jsonStr = JSON.stringify(exportData, null, 2);
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    this.downloadBlob(blob, 'json');
+  }
+
+  /**
+   * 記録したフレームデータをCSVファイルとしてダウンロード
+   */
+  public exportCSV(): void {
+    if (this.recordedFrames.length === 0) {
+      return;
+    }
+
+    const header = 'timestamp,rx,ry,rz,vx,vy,vz,label\n';
+    const rows = this.recordedFrames
+      .map((f) => `${f.timestamp},${f.features.join(',')},${f.label}`)
+      .join('\n');
+
+    const blob = new Blob([header + rows], { type: 'text/csv;charset=utf-8;' });
+    this.downloadBlob(blob, 'csv');
+  }
+
+  private downloadBlob(blob: Blob, extension: string): void {
+    const url = URL.createObjectURL(blob);
     const now = new Date();
     const pad = (n: number) => n.toString().padStart(2, '0');
     const yyyy = now.getFullYear();
@@ -157,7 +308,7 @@ export class FeatureLogger {
     const hh = pad(now.getHours());
     const min = pad(now.getMinutes());
     const ss = pad(now.getSeconds());
-    const fileName = `dataset_index_${yyyy}${mm}${dd}_${hh}${min}${ss}.json`;
+    const fileName = `dataset_index_${yyyy}${mm}${dd}_${hh}${min}${ss}.${extension}`;
 
     const a = document.createElement('a');
     a.href = url;
@@ -180,3 +331,4 @@ export class FeatureLogger {
     }
   }
 }
+

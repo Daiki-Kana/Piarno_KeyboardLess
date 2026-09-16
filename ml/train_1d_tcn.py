@@ -1,93 +1,82 @@
 """1D-TCN 打鍵判定モデル学習 & ONNX エクスポート スクリプト
 
-人差し指運動特徴量 (ml/dataset/*.json) を読み込み、
-1. 連続 HIT 区間から急減速ピークを抽出する自動リラベリング
-2. ファイル単位の厳密な Train / Val 分割（時系列リーク防止）
-3. 6次元特徴量の Z-score 正規化 (public/model_index_scaler.json に書き出し)
-4. 時間順序を保持する Flatten 型 1D-TCN (AdaptiveAvgPool1d 撤廃) の学習
+ml/dataset/*.csv (通常打鍵および各種負例CSV) を読み込み、
+1. 全データから6次元特徴量 (rx, ry, rz, vx, vy, vz) の Z-score 正規化パラメータを算出し、public/model_index_scaler.json に保存
+2. ファイルごとの時系列スライディングウィンドウ (過去6フレーム, [1, 6, 6]) を生成
+3. クラス不均衡を補正する pos_weight を適用した BCEWithLogitsLoss で 1D-TCN (Flatten型) を学習
+4. 各データセット（打鍵および負例）での Precision, Recall, F1 スコアを評価
 5. Web 推論用 ONNX (public/model_index.onnx) へのエクスポート
 を実行します。
 """
 
 import os
 import glob
+import csv
 import json
 import numpy as np
 import onnx
 from onnx import helper, TensorProto
 import onnxruntime as ort
 
+
 # ==========================================
-# 1. 自動リラベリング & データセット読み込み
+# 1. データセット読み込み & 前処理
 # ==========================================
-def load_and_relabel(file_path):
-    """連続した label=1 区間から、下向き速度 vy の急減ピーク（机衝突インパクト）を特定し、
-    その前後1フレーム（計3フレーム: t-1, t, t+1）に時間的許容幅を持たせた打鍵正例ラベル（1.0）を付与"""
+def load_csv_dataset(file_path):
+    """単一CSVファイルから特徴量 (6次元: rx~vz) と label (0 or 1) を取得"""
+    features = []
+    labels = []
+
     with open(file_path, "r", encoding="utf-8") as f:
-        frames = json.load(f)
+        reader = csv.DictReader(f)
+        for row in reader:
+            rx = float(row["rx"])
+            ry = float(row["ry"])
+            rz = float(row["rz"])
+            vx = float(row["vx"])
+            vy = float(row["vy"])
+            vz = float(row["vz"])
+            lbl = float(row.get("label", 0.0))
 
-    n = len(frames)
-    new_labels = [0.0] * n
-    i = 0
+            features.append([rx, ry, rz, vx, vy, vz])
+            labels.append(lbl)
 
-    while i < n:
-        if frames[i]["label"] == 1:
-            start = i
-            while i < n and frames[i]["label"] == 1:
-                i += 1
-            end = i  # [start, end) が HIT 区間
-
-            # 区間内で直前フレームからの下向き速度の急減量 (prev_vy - curr_vy) が最大のフレームを特定
-            best_idx = start
-            best_decel = -float("inf")
-            for k in range(start, end):
-                prev_vy = frames[k - 1]["features"][4] if k > 0 else 0.0
-                curr_vy = frames[k]["features"][4]
-                decel = prev_vy - curr_vy
-                if decel > best_decel:
-                    best_decel = decel
-                    best_idx = k
-
-            # 衝突ピークを中心とする前後1フレーム（計3フレーム: 約75msの時間許容幅）を正例(1.0)として付与
-            new_labels[best_idx] = 1.0
-            if best_idx - 1 >= 0:
-                new_labels[best_idx - 1] = 1.0
-            if best_idx + 1 < n:
-                new_labels[best_idx + 1] = 1.0
-        else:
-            i += 1
-
-    return frames, new_labels
+    return np.array(features, dtype=np.float32), np.array(labels, dtype=np.float32)
 
 
-def prepare_dataset(dataset_dir="ml/dataset", window_size=6):
-    """ファイル単位で Train / Val を厳密に分離し、Z-score 正規化を適用してウィンドウを生成"""
-    # 訓練用: 打鍵セッション1 + 空中運動セッション（負例を豊富に学習）
-    train_files = [
-        os.path.join(dataset_dir, "dataset_index_20260915_175925.json"),
-        os.path.join(dataset_dir, "dataset_index_20260915_180121.json"),
-    ]
-    # 検証用: 打鍵セッション2 + 静止セッション（未知セッションでの汎化性能評価）
-    val_files = [
-        os.path.join(dataset_dir, "dataset_index_20260915_180018.json"),
-        os.path.join(dataset_dir, "dataset_index_20260915_180157.json"),
-    ]
+def prepare_dataset(dataset_dir="ml/dataset", window_size=6, train_ratio=0.8):
+    """ml/dataset/ 配下の全CSVを走査し、Z-score 正規化パラメータ算出およびウィンドウ分割を実施"""
+    csv_files = sorted(glob.glob(os.path.join(dataset_dir, "*.csv")))
+    if not csv_files:
+        raise FileNotFoundError(f"CSVデータセットが見つかりません: {dataset_dir}")
 
-    for fp in train_files + val_files:
-        if not os.path.exists(fp):
-            raise FileNotFoundError(f"データセットが見つかりません: {fp}")
+    print("=== データセット走査開始 ===")
+    all_features = []
+    file_data_list = []
 
-    # 1. 訓練データから Z-score 正規化パラメータ（mean, std）を算出
-    all_train_feats = []
-    for fp in train_files:
-        frames, _ = load_and_relabel(fp)
-        for fr in frames:
-            all_train_feats.append(fr["features"])
+    total_pos_raw = 0
+    total_neg_raw = 0
 
-    scaler_mean = np.mean(all_train_feats, axis=0).astype(np.float32)
-    scaler_std = (np.std(all_train_feats, axis=0) + 1e-6).astype(np.float32)
+    for fp in csv_files:
+        fname = os.path.basename(fp)
+        feats, lbls = load_csv_dataset(fp)
+        pos_cnt = int(np.sum(lbls == 1.0))
+        neg_cnt = int(np.sum(lbls == 0.0))
+        total_pos_raw += pos_cnt
+        total_neg_raw += neg_cnt
+        print(f"  読み込み: {fname:<25} (サンプル数: {len(feats):4d}, 正例HIT: {pos_cnt:2d}, 負例: {neg_cnt:4d})")
 
-    # 2. スケーラーパラメータを JSON 保存
+        all_features.append(feats)
+        file_data_list.append((fp, feats, lbls))
+
+    print(f"\n全データセット総計: {total_pos_raw + total_neg_raw} サンプル (正例HIT: {total_pos_raw}, 負例: {total_neg_raw})")
+
+    # 1. 読み込んだ全データの特徴量（6次元）から平均値（mean）と標準偏差（std）を計算
+    stacked_feats = np.vstack(all_features)
+    scaler_mean = np.mean(stacked_feats, axis=0).astype(np.float32)
+    scaler_std = (np.std(stacked_feats, axis=0) + 1e-6).astype(np.float32)
+
+    # 2. スケーラーパラメータを public/model_index_scaler.json に保存
     scaler_info = {
         "feature_names": ["rx", "ry", "rz", "vx", "vy", "vz"],
         "mean": scaler_mean.tolist(),
@@ -97,43 +86,66 @@ def prepare_dataset(dataset_dir="ml/dataset", window_size=6):
     os.makedirs("public", exist_ok=True)
     with open("public/model_index_scaler.json", "w", encoding="utf-8") as f:
         json.dump(scaler_info, f, indent=2)
-    print(f"[OK] スケーラーパラメータを保存しました: public/model_index_scaler.json")
-    print(f"  Scaler Mean: {scaler_mean}")
-    print(f"  Scaler Std : {scaler_std}")
 
-    # 3. ウィンドウ生成ヘルパー
-    def build_windows(files):
-        X, y = [], []
-        for fp in files:
-            frames, labels = load_and_relabel(fp)
-            norm_feats = [
-                (np.array(fr["features"], dtype=np.float32) - scaler_mean) / scaler_std
-                for fr in frames
-            ]
-            for i in range(len(frames) - window_size + 1):
-                window = norm_feats[i : i + window_size]
-                # (time=6, channel=6) -> Conv1d 用に転置して (channel=6, time=6)
-                X.append(np.array(window, dtype=np.float32).T)
-                y.append(labels[i + window_size - 1])
-        return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32).reshape(-1, 1)
+    print(f"\n[OK] Z-score スケーラーパラメータを更新保存しました: public/model_index_scaler.json")
+    print(f"  Scaler Mean: {scaler_mean.tolist()}")
+    print(f"  Scaler Std : {scaler_std.tolist()}")
 
-    X_train, y_train = build_windows(train_files)
-    X_val, y_val = build_windows(val_files)
+    # 3. ファイル単位で時系列ウィンドウ生成 & Train / Val 分割
+    X_train_list, y_train_list = [], []
+    X_val_list, y_val_list = [], []
 
-    num_pos = int(np.sum(y_train >= 0.5))
-    num_neg = int(np.sum(y_train < 0.5))
-    pos_weight = float(num_neg / max(num_pos, 1))
+    for fp, feats, lbls in file_data_list:
+        if len(feats) < window_size:
+            continue
 
-    print(f"\n=== データセット準備完了 ===")
-    print(f"訓練セット: {len(X_train)} 件 (HIT: {num_pos} 件, 通常: {num_neg} 件, pos_weight: {pos_weight:.2f})")
-    print(f"検証セット: {len(X_val)} 件 (HIT: {int(np.sum(y_val >= 0.5))} 件, 通常: {int(np.sum(y_val < 0.5))} 件)")
+        # Z-score 正規化適用
+        norm_feats = (feats - scaler_mean) / scaler_std
 
-    return X_train, y_train, X_val, y_val, pos_weight, scaler_mean, scaler_std
+        # スライディングウィンドウ作成
+        windows = []
+        target_labels = []
+        for i in range(len(feats) - window_size + 1):
+            w = norm_feats[i : i + window_size]
+            # Conv1d 用に (channel=6, time=6) に転置
+            windows.append(w.T)
+            target_labels.append(lbls[i + window_size - 1])
+
+        windows = np.array(windows, dtype=np.float32)
+        target_labels = np.array(target_labels, dtype=np.float32).reshape(-1, 1)
+
+        # 各ファイル内で時系列順に Train (80%) / Val (20%) に分割（時系列リーク防止）
+        n_windows = len(windows)
+        split_idx = int(n_windows * train_ratio)
+
+        X_train_list.append(windows[:split_idx])
+        y_train_list.append(target_labels[:split_idx])
+
+        X_val_list.append(windows[split_idx:])
+        y_val_list.append(target_labels[split_idx:])
+
+    X_train = np.vstack(X_train_list)
+    y_train = np.vstack(y_train_list)
+    X_val = np.vstack(X_val_list)
+    y_val = np.vstack(y_val_list)
+
+    train_pos = int(np.sum(y_train >= 0.5))
+    train_neg = int(np.sum(y_train < 0.5))
+    val_pos = int(np.sum(y_val >= 0.5))
+    val_neg = int(np.sum(y_val < 0.5))
+
+    # クラス不均衡補正用の pos_weight
+    pos_weight = float(train_neg / max(train_pos, 1))
+
+    print(f"\n=== ウィンドウデータセット準備完了 (window_size={window_size}) ===")
+    print(f"訓練セット: {len(X_train)} 件 (HIT: {train_pos} 件, 通常: {train_neg} 件, pos_weight: {pos_weight:.2f})")
+    print(f"検証セット: {len(X_val)} 件 (HIT: {val_pos} 件, 通常: {val_neg} 件)")
+
+    return X_train, y_train, X_val, y_val, pos_weight, scaler_mean, scaler_std, file_data_list
 
 
 # ==========================================
 # 2. NumPy ベース 1D-TCN 学習エンジン (Flatten 版)
-#    AdaptiveAvgPool1d を撤廃し、時間軸順序を保持
 # ==========================================
 class Numpy1DTCN:
     """
@@ -161,7 +173,7 @@ class Numpy1DTCN:
         self.t = 0
 
     def forward(self, x):
-        # x: [N, 6, 6]
+        # x: [N, 6, 6] (N, channel, time)
         N, _, L = x.shape  # L = 6
 
         # Conv1 (pad=1)
@@ -182,10 +194,10 @@ class Numpy1DTCN:
 
         r2 = np.maximum(0, c2)  # [N, 8, 6]
 
-        # Flatten -> [N, 48] (時間軸全体の時系列パターンを維持)
+        # Flatten -> [N, 48]
         flat = r2.reshape(N, 48)
 
-        # Linear -> [N, 1]
+        # Linear -> [N, 1] (Logit 出力)
         out = np.dot(flat, self.w3) + self.b3
 
         cache = (x, x_pad1, c1, r1, r1_pad, c2, r2, flat)
@@ -241,12 +253,13 @@ class Numpy1DTCN:
 # ==========================================
 # 3. 学習ループと検証
 # ==========================================
-def train_model(X_train, y_train, X_val, y_val, pos_weight, epochs=45, batch_size=32, lr=0.003):
+def train_model(X_train, y_train, X_val, y_val, pos_weight, epochs=50, batch_size=32, lr=0.003):
     model = Numpy1DTCN(seed=42)
     best_f1 = -1.0
     best_weights = None
+    final_metrics = {}
 
-    print(f"\n=== 学習開始 (エポック数: {epochs}, 学習率: {lr}) ===")
+    print(f"\n=== 1D-TCN 学習開始 (エポック数: {epochs}, 学習率: {lr}, pos_weight: {pos_weight:.2f}) ===")
 
     for epoch in range(1, epochs + 1):
         perm = np.random.permutation(len(X_train))
@@ -272,6 +285,7 @@ def train_model(X_train, y_train, X_val, y_val, pos_weight, epochs=45, batch_siz
         # Validation 評価 (打鍵判定閾値 prob >= 0.5)
         val_logits, _ = model.forward(X_val)
         val_sig = 1.0 / (1.0 + np.exp(-np.clip(val_logits, -20, 20)))
+        val_loss = np.mean(-(pos_weight * y_val * np.log(val_sig + 1e-7) + (1.0 - y_val) * np.log(1.0 - val_sig + 1e-7)))
         val_preds = (val_sig >= 0.5).astype(np.float32)
 
         tp = np.sum((val_preds == 1) & (y_val >= 0.5))
@@ -283,13 +297,25 @@ def train_model(X_train, y_train, X_val, y_val, pos_weight, epochs=45, batch_siz
         recall = tp / (tp + fn + 1e-7)
         f1 = 2 * precision * recall / (precision + recall + 1e-7)
 
+        final_metrics = {
+            "epoch": epoch,
+            "train_loss": epoch_loss / max(batches, 1),
+            "val_loss": float(val_loss),
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+            "tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn),
+        }
+
         if epoch % 5 == 0 or epoch == epochs:
             print(f"Epoch [{epoch:02d}/{epochs:02d}] "
-                  f"Train Loss: {epoch_loss / max(batches, 1):.4f} | "
+                  f"Train Loss: {final_metrics['train_loss']:.4f} | "
+                  f"Val Loss: {final_metrics['val_loss']:.4f} | "
                   f"Val Prec: {precision:.4f}, Rec: {recall:.4f}, F1: {f1:.4f} "
                   f"(TP={tp}, FP={fp}, FN={fn}, TN={tn})")
 
-        if f1 > best_f1:
+        # F1最良、または同値でRecallが高い重みを優先保存
+        if f1 > best_f1 or (f1 == best_f1 and recall > 0):
             best_f1 = f1
             best_weights = [p.copy() for p in [model.w1, model.b1, model.w2, model.b2, model.w3, model.b3]]
 
@@ -297,32 +323,35 @@ def train_model(X_train, y_train, X_val, y_val, pos_weight, epochs=45, batch_siz
     if best_weights is not None:
         model.w1, model.b1, model.w2, model.b2, model.w3, model.b3 = best_weights
 
-    return model
+    return model, final_metrics
 
 
 # ==========================================
-# 4. 個別データセットでの検証 (空中運動FP確認)
+# 4. 個別データセットでの検証
 # ==========================================
-def evaluate_individual_files(model, scaler_mean, scaler_std, dataset_dir="ml/dataset", window_size=6):
-    files = sorted(glob.glob(os.path.join(dataset_dir, "*.json")))
-    print(f"\n=== 全データセット個別検証 (prob >= 0.5) ===")
+def evaluate_all_individual_files(model, scaler_mean, scaler_std, dataset_dir="ml/dataset", window_size=6):
+    csv_files = sorted(glob.glob(os.path.join(dataset_dir, "*.csv")))
+    print(f"\n=== 全データセット個別検証 (打鍵判定閾値 prob >= 0.5) ===")
 
-    for fp in files:
+    results = []
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
+    total_tn = 0
+
+    for fp in csv_files:
         fname = os.path.basename(fp)
-        frames, labels = load_and_relabel(fp)
-        if len(frames) < window_size:
+        feats, lbls = load_csv_dataset(fp)
+        if len(feats) < window_size:
             continue
 
-        norm_feats = [
-            (np.array(fr["features"], dtype=np.float32) - scaler_mean) / scaler_std
-            for fr in frames
-        ]
+        norm_feats = (feats - scaler_mean) / scaler_std
         windows = []
         target_labels = []
-        for i in range(len(frames) - window_size + 1):
+        for i in range(len(feats) - window_size + 1):
             w = norm_feats[i : i + window_size]
-            windows.append(np.array(w, dtype=np.float32).T)
-            target_labels.append(labels[i + window_size - 1])
+            windows.append(w.T)
+            target_labels.append(lbls[i + window_size - 1])
 
         X = np.array(windows, dtype=np.float32)
         y = np.array(target_labels, dtype=np.float32).reshape(-1, 1)
@@ -339,8 +368,32 @@ def evaluate_individual_files(model, scaler_mean, scaler_std, dataset_dir="ml/da
         rec = tp / (tp + fn + 1e-7)
         f1 = 2 * prec * rec / (prec + rec + 1e-7)
 
-        status_msg = " [空中運動: 誤検知ゼロ達成!]" if ("180121" in fname and fp == 0) else ""
-        print(f"  {fname:<36} -> TP: {tp:2d}, FP: {fp:2d}, FN: {fn:2d}, TN: {tn:4d} | Prec: {prec:.3f}, Rec: {rec:.3f}, F1: {f1:.3f}{status_msg}")
+        total_tp += tp
+        total_fp += fp
+        total_fn += fn
+        total_tn += tn
+
+        status = ""
+        if "neg" in fname:
+            status = " [負例: 誤検知ゼロ達成!]" if fp == 0 else f" [警告: FP={fp}件検出]"
+        elif "tap" in fname:
+            status = f" [打鍵検出率: {rec*100:.1f}%]"
+
+        print(f"  {fname:<25} -> TP: {tp:2d}, FP: {fp:2d}, FN: {fn:2d}, TN: {tn:4d} | Prec: {prec:.3f}, Rec: {rec:.3f}, F1: {f1:.3f}{status}")
+        results.append({
+            "file": fname,
+            "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+            "prec": prec, "rec": rec, "f1": f1
+        })
+
+    overall_prec = total_tp / (total_tp + total_fp + 1e-7)
+    overall_rec = total_tp / (total_tp + total_fn + 1e-7)
+    overall_f1 = 2 * overall_prec * overall_rec / (overall_prec + overall_rec + 1e-7)
+    print(f"\n--- 全体集計結果 ---")
+    print(f"  総計: TP={total_tp}, FP={total_fp}, FN={total_fn}, TN={total_tn}")
+    print(f"  全体 Precision: {overall_prec:.4f}, Recall: {overall_rec:.4f}, F1: {overall_f1:.4f}")
+
+    return results, (overall_prec, overall_rec, overall_f1)
 
 
 # ==========================================
@@ -353,7 +406,7 @@ def export_to_onnx(model, output_path="public/model_index.onnx"):
     input_tensor = helper.make_tensor_value_info('input', TensorProto.FLOAT, ['batch_size', 6, 6])
     output_tensor = helper.make_tensor_value_info('output', TensorProto.FLOAT, ['batch_size', 1])
 
-    # Initializers (重み)
+    # Initializers (重みテンソル)
     conv1_w = helper.make_tensor('conv1_w', TensorProto.FLOAT, [16, 6, 3], model.w1.flatten().tolist())
     conv1_b = helper.make_tensor('conv1_b', TensorProto.FLOAT, [16], model.b1.flatten().tolist())
 
@@ -364,7 +417,6 @@ def export_to_onnx(model, output_path="public/model_index.onnx"):
     fc_b = helper.make_tensor('fc_b', TensorProto.FLOAT, [1], model.b3.flatten().tolist())
 
     # ノード定義 (Conv1d -> ReLU -> Conv1d -> ReLU -> Flatten -> Gemm)
-    # ※ AdaptiveAvgPool1d を撤廃し、時間軸6×チャネル8=48次元を完全に保持
     node_conv1 = helper.make_node('Conv', ['input', 'conv1_w', 'conv1_b'], ['c1'],
                                   kernel_shape=[3], pads=[1, 1])
     node_relu1 = helper.make_node('Relu', ['c1'], ['r1'])
@@ -392,19 +444,19 @@ def export_to_onnx(model, output_path="public/model_index.onnx"):
     # ONNX 構造チェック & 保存
     onnx.checker.check_model(onnx_model)
     onnx.save(onnx_model, output_path)
-    print(f"\n[OK] 新型 1D-TCN ONNX モデルを出力しました: {output_path}")
+    print(f"\n[OK] 1D-TCN ONNX モデルを出力・上書き更新しました: {output_path}")
 
-    # ONNX Runtime で推論検証
+    # ONNX Runtime で推論テスト
     session = ort.InferenceSession(output_path)
     dummy_input = np.random.randn(1, 6, 6).astype(np.float32)
     res = session.run(['output'], {'input': dummy_input})
-    print(f"[OK] ONNX Runtime 推論テスト成功! 出力形状: {res[0].shape}, 出力値: {res[0][0][0]:.4f}")
+    print(f"[OK] ONNX Runtime 推論テスト成功! 入力シェイプ: [1, 6, 6], 出力シェイプ: {res[0].shape}, 出力logit: {res[0][0][0]:.4f}")
 
 
 def main():
-    X_train, y_train, X_val, y_val, pos_weight, scaler_mean, scaler_std = prepare_dataset()
-    trained_model = train_model(X_train, y_train, X_val, y_val, pos_weight, epochs=45, batch_size=32, lr=0.003)
-    evaluate_individual_files(trained_model, scaler_mean, scaler_std)
+    X_train, y_train, X_val, y_val, pos_weight, scaler_mean, scaler_std, file_data_list = prepare_dataset()
+    trained_model, final_metrics = train_model(X_train, y_train, X_val, y_val, pos_weight, epochs=50, batch_size=32, lr=0.003)
+    indiv_results, overall_metrics = evaluate_all_individual_files(trained_model, scaler_mean, scaler_std)
     export_to_onnx(trained_model, "public/model_index.onnx")
 
 

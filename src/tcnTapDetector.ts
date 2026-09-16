@@ -25,11 +25,16 @@ export interface TcnDebugStatus {
   isReady: boolean;
   errorMessage: string | null; // 初期化または推論エラー文字列
   prob: number;       // 最新モデル推論確率 (0.0 ~ 1.0)
+  ry: number;         // 最新の人差し指相対高さ (打鍵深さ)
+  wristY: number;     // 最新の手首Y座標 (空中ガード用: 画面下部ほど大)
+  isPeak: boolean;    // 直近フレームで最下点変曲点（机接触ピーク）を検知したか
   decel: number;      // 直近の減速度 (prevVy - currVy)
   prevVy: number;
   currVy: number;
   tapCount: number;   // 累計検知回数
   minProb: number;    // 現在の確率閾値
+  minDepth: number;   // 現在の打鍵深さ閾値
+  minWristY: number;  // 現在の手首高さ閾値 (空中キャンセル)
   minDecel: number;   // 現在の減速閾値
   cooldownMs: number; // 現在のクールダウン時間
   recentLogs: TapLogEntry[]; // 直近打鍵ログ（最大3件）
@@ -44,13 +49,22 @@ export class TcnTapDetector {
   // 過去6フレームの特徴量履歴 [ [rx, ry, rz, vx, vy, vz], ... ] (長さ最大6)
   private featureHistory: number[][] = [];
 
-  // 直前フレームの局所相対位置とタイムスタンプ（速度計算用）
+  // 直近フレームの局所相対位置とタイムスタンプ（速度計算用）
   private lastR: { x: number; y: number; z: number } | null = null;
   private lastTimestamp: number | null = null;
 
+  // 直近フレームの指先相対深さ履歴（最下点変曲点・ピーク検知用）
+  private ryHistory: number[] = [];
+
   // リアルタイム調整可能パラメータ（初期値）
-  private minProb = 0.50;
-  private minDecel = 0.30;
+  // 低速押し込み打鍵（実測prob ~0.23）も拾えるよう初期値を0.25に設定
+  private minProb = 0.25;
+  // 手首Y座標による空中キャンセルガード (0.0で無効, デフォルト0.45: 画面下半分)
+  private minWristY = 0.45;
+  // 打鍵深さ（正例統計: ry >= 0.2177）による位置ベースガード
+  private minDepth = 0.15;
+  // 加速度（減速度）依存を解除するため初期値を 0.0 (OFF) に設定
+  private minDecel = 0.0;
   private cooldownMs = 100;
 
   // チャタリング防止用クールダウン（ms）
@@ -66,6 +80,9 @@ export class TcnTapDetector {
 
   // デバッグオーバーレイ用リアルタイムステータス
   private lastProb = 0;
+  private lastRy = 0;
+  private lastWristY = 0;
+  private lastIsPeak = false;
   private lastDecel = 0;
   private lastPrevVy = 0;
   private lastCurrVy = 0;
@@ -189,6 +206,8 @@ export class TcnTapDetector {
     const mcp = targetHand.allLandmarks[5];   // Index MCP (5)
     const tip = targetHand.allLandmarks[8];   // Index Tip (8)
 
+    this.lastWristY = wrist.y;
+
     // スケール正規化基準長 L = ||Index MCP - Wrist||
     const dx = mcp.x - wrist.x;
     const dy = mcp.y - wrist.y;
@@ -199,6 +218,12 @@ export class TcnTapDetector {
     const rx = (tip.x - mcp.x) / L;
     const ry = (tip.y - mcp.y) / L;
     const rz = (tip.z - mcp.z) / L;
+
+    // 指先相対深さ履歴の更新（最下点変曲点・ピーク検知用）
+    this.ryHistory.push(ry);
+    if (this.ryHistory.length > 6) {
+      this.ryHistory.shift();
+    }
 
     // 局所相対速度 v(t)
     let vx = 0;
@@ -238,18 +263,19 @@ export class TcnTapDetector {
     }
 
     if (!this.isInferring) {
-      return await this.runInferenceLoop(targetHand, tip, timestamp);
+      return await this.runInferenceLoop(targetHand, tip, wrist, timestamp);
     }
 
     return null;
   }
 
   /**
-   * 推論処理ループ: リアルタイム調整パラメータに基づいて判定
+   * 推論処理ループ: 机面判定・最下点変曲点・時系列モデルのハイブリッド判定
    */
   private async runInferenceLoop(
     targetHand: HandData,
     tip: { x: number; y: number; z: number },
+    wrist: { x: number; y: number; z: number },
     timestamp: number
   ): Promise<TapEvent | null> {
     this.isInferring = true;
@@ -277,30 +303,64 @@ export class TcnTapDetector {
         const logit = Number(outputTensor.data[0]);
 
         const prob = 1.0 / (1.0 + Math.exp(-logit));
-        this.lastProb = prob;
-
         const prevVy = historySnapshot[4][4];
         const currVy = historySnapshot[5][4];
         const decel = prevVy - currVy;
+        const currentRy = historySnapshot[5][1]; // 人差し指相対深さ ry
+
+        // 1. 手首Y座標による空中キャンセルガード (机面レベル判定: 画面下部ほどY大)
+        // 手を空中に持ち上げているときは wrist.y が小さくなり即座にブロック
+        const wristPassed = this.minWristY <= 0.001 || wrist.y >= this.minWristY;
+
+        // 2. 指先打鍵深度ガード (机面に向けて十分に押し込まれているか)
+        const depthPassed = currentRy >= this.minDepth;
+
+        // 3. 最下点変曲点（ピーク）検知: 下向き進行から机面に接触して停止/反発した瞬間
+        let isPeak = false;
+        if (this.ryHistory.length >= 3) {
+          const r0 = this.ryHistory[this.ryHistory.length - 3];
+          const r1 = this.ryHistory[this.ryHistory.length - 2];
+          const r2 = this.ryHistory[this.ryHistory.length - 1];
+          // 直前フレームまで押し込まれており (r1 >= r0)、現在フレームで停止または跳ね返った (r2 <= r1 + 0.035)
+          isPeak = (r1 >= r0 - 0.015) && (r2 <= r1 + 0.035);
+        }
+
+        // 4. モデル推論確率判定 (低速打鍵での prob ~0.23 も許容)
+        const probPassed = prob >= this.minProb;
+
+        // 5. 減速度条件 (minDecel <= 0.001 の場合は加速度を要求せず無効化)
+        const decelPassed = this.minDecel <= 0.001 ? true : decel >= this.minDecel;
+
+        this.lastProb = prob;
+        this.lastRy = currentRy;
+        this.lastWristY = wrist.y;
+        this.lastIsPeak = isPeak;
         this.lastDecel = decel;
         this.lastPrevVy = prevVy;
         this.lastCurrVy = currVy;
 
-        // リアルタイムパラメータに基づく打鍵判定
-        // minDecel <= 0.001 の場合は物理急減速を要求せず、純粋にモデル確率のみで判定
-        const decelPassed = this.minDecel <= 0.001 ? true : decel >= this.minDecel;
         const isTap =
           (timestamp - this.lastTapTimestamp >= this.cooldownMs) &&
-          (prob >= this.minProb) &&
+          wristPassed &&
+          depthPassed &&
+          isPeak &&
+          probPassed &&
           decelPassed;
 
         if (isTap) {
           this.lastTapTimestamp = timestamp;
           this.tapCount++;
 
+          // 打鍵深さ・速度・確信度から自然なベロシティを算出（加速度単体依存を完全撤廃）
           const velocity = Math.min(
             1.0,
-            Math.max(0.35, 0.35 + (Math.max(0, decel) / 10.0) * 0.45 + (prob - this.minProb) * 0.4)
+            Math.max(
+              0.35,
+              0.35 +
+                Math.max(0, currentRy - this.minDepth) * 0.4 +
+                Math.max(0, currVy) * 0.05 +
+                Math.max(0, prob - this.minProb) * 0.3
+            )
           );
 
           // 直近打鍵ログに記録（最大3件保持）
@@ -318,7 +378,7 @@ export class TcnTapDetector {
           }
 
           console.log(
-            `[1D-TCN 打鍵検知] Logit: ${logit.toFixed(3)}, Prob: ${(prob * 100).toFixed(1)}%, Decel: ${decel.toFixed(2)}, Vel: ${velocity.toFixed(2)}`
+            `[机面ハイブリッド打鍵検知] Prob: ${(prob * 100).toFixed(1)}%, Depth: ${currentRy.toFixed(2)}, WristY: ${wrist.y.toFixed(2)}, Peak: ${isPeak}, Vel: ${velocity.toFixed(2)}`
           );
 
           const resolvedHandedness: 'Left' | 'Right' =
@@ -352,6 +412,14 @@ export class TcnTapDetector {
     this.minProb = Math.max(0.1, Math.min(0.99, val));
   }
 
+  public setMinWristY(val: number): void {
+    this.minWristY = Math.max(0.0, Math.min(1.0, val));
+  }
+
+  public setMinDepth(val: number): void {
+    this.minDepth = Math.max(0.0, Math.min(1.0, val));
+  }
+
   public setMinDecel(val: number): void {
     this.minDecel = Math.max(0.0, Math.min(10.0, val));
   }
@@ -363,6 +431,8 @@ export class TcnTapDetector {
   public getParams() {
     return {
       minProb: this.minProb,
+      minWristY: this.minWristY,
+      minDepth: this.minDepth,
       minDecel: this.minDecel,
       cooldownMs: this.cooldownMs,
     };
@@ -376,11 +446,16 @@ export class TcnTapDetector {
       isReady: this.isReady,
       errorMessage: this.errorMessage,
       prob: this.lastProb,
+      ry: this.lastRy,
+      wristY: this.lastWristY,
+      isPeak: this.lastIsPeak,
       decel: this.lastDecel,
       prevVy: this.lastPrevVy,
       currVy: this.lastCurrVy,
       tapCount: this.tapCount,
       minProb: this.minProb,
+      minWristY: this.minWristY,
+      minDepth: this.minDepth,
       minDecel: this.minDecel,
       cooldownMs: this.cooldownMs,
       recentLogs: [...this.recentTapLogs],

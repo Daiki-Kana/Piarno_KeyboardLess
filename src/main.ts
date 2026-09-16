@@ -4,6 +4,7 @@ import { PianoSynth } from "./pianoSynth";
 import { SongSequencer } from "./songSequencer";
 import { VirtualPositionManager, TargetFinger } from "./virtualPositionManager";
 import { FeatureLogger } from "./featureLogger";
+import { FrameStepLabeler } from "./frameStepLabeler";
 import { TcnTapDetector } from "./tcnTapDetector";
 import { checkAndTriggerTcnTap } from "./checkAndTriggerTcnTap";
 
@@ -25,6 +26,7 @@ const countdownDisplay = document.getElementById(
 // データ収集UI要素
 const recBtn = document.getElementById("rec-btn") as HTMLButtonElement;
 const hitBtn = document.getElementById("hit-btn") as HTMLButtonElement;
+const reviewOpenBtn = document.getElementById("review-open-btn") as HTMLButtonElement;
 const exportBtn = document.getElementById("export-btn") as HTMLButtonElement;
 const loggerStatusIndicator = document.getElementById(
   "logger-status-indicator",
@@ -36,12 +38,18 @@ const statHand = document.getElementById("stat-hand") as HTMLElement;
 // 推論デバッグHUD要素 (白黒リアルタイム表示 & リアルタイム感度調整)
 const hudTcnReady = document.getElementById("hud-tcn-ready") as HTMLElement;
 const hudProb = document.getElementById("hud-prob") as HTMLElement;
-const hudDecel = document.getElementById("hud-decel") as HTMLElement;
+const hudDepth = document.getElementById("hud-depth") as HTMLElement;
+const hudWrist = document.getElementById("hud-wrist") as HTMLElement;
+const hudPeak = document.getElementById("hud-peak") as HTMLElement;
 const hudTapCount = document.getElementById("hud-tap-count") as HTMLElement;
 const hudToggleBtn = document.getElementById("hud-toggle-btn") as HTMLButtonElement;
 const hudPanel = document.getElementById("hud-panel") as HTMLElement;
 const sliderProb = document.getElementById("slider-prob") as HTMLInputElement;
 const valProb = document.getElementById("val-prob") as HTMLElement;
+const sliderWrist = document.getElementById("slider-wrist") as HTMLInputElement;
+const valWrist = document.getElementById("val-wrist") as HTMLElement;
+const sliderDepth = document.getElementById("slider-depth") as HTMLInputElement;
+const valDepth = document.getElementById("val-depth") as HTMLElement;
 const sliderDecel = document.getElementById("slider-decel") as HTMLInputElement;
 const valDecel = document.getElementById("val-decel") as HTMLElement;
 const sliderCooldown = document.getElementById("slider-cooldown") as HTMLInputElement;
@@ -61,7 +69,18 @@ function updateDebugHUD(): void {
     hudTcnReady.style.textDecoration = '';
   }
   hudProb.textContent = `Prob: ${(status.prob * 100).toFixed(1)}%`;
-  hudDecel.textContent = `Decel: ${status.decel.toFixed(2)}`;
+  if (hudDepth) {
+    hudDepth.textContent = `Depth: ${status.ry.toFixed(2)}`;
+  }
+  if (hudWrist) {
+    hudWrist.textContent = `WristY: ${status.wristY.toFixed(2)}`;
+    // 空中判定時は打ち消し線を表示
+    hudWrist.style.opacity = status.minWristY > 0 && status.wristY < status.minWristY ? '0.4' : '1.0';
+  }
+  if (hudPeak) {
+    hudPeak.textContent = `Peak: ${status.isPeak ? 'HIT' : '-'}`;
+    hudPeak.style.color = status.isPeak ? '#ffffff' : '#777777';
+  }
   hudTapCount.textContent = `Tap Count: ${status.tapCount}`;
 
   // 打鍵検知があった場合のみ直近打鍵ログリストを軽量更新（無駄な毎フレーム再描画を回避）
@@ -86,14 +105,31 @@ export const pianoSynth = new PianoSynth();
 export const sequencer = new SongSequencer();
 export const positionManager = new VirtualPositionManager("C4", "C4");
 const filterMap = new Map<string, OneEuroFilter3D>();
+// 解剖学的ガード用の人差し指正常相対ベクトル保持Map
+const lastValidIndexRelMap = new Map<string, { x: number; y: number; z: number }>();
+let frameStepLabeler: FrameStepLabeler | null = null;
 
-// 1D-TCN用 特徴量ロガーインスタンス（UI表示コールバックを接続）
-const featureLogger = new FeatureLogger((status) => {
-  statFrames.textContent = status.frameCount.toString();
-  statHits.textContent = status.hitCount.toString();
-  statHand.textContent = status.isTracked ? status.targetHand : "-";
-  exportBtn.disabled = status.frameCount === 0;
-});
+const featureLogger = new FeatureLogger(
+  (status) => {
+    statFrames.textContent = status.frameCount.toString();
+    statHits.textContent = status.hitCount.toString();
+    statHand.textContent = status.isTracked ? status.targetHand : "-";
+    exportBtn.disabled = status.frameCount === 0;
+    if (reviewOpenBtn) {
+      reviewOpenBtn.disabled = status.frameCount === 0;
+    }
+  },
+  (frames) => {
+    // 録画停止後、即座にコマ送りレビューモードに切り替え
+    if (frameStepLabeler && frames.length > 0) {
+      frameStepLabeler.open(frames);
+    }
+  }
+);
+
+// コマ送り手動ラベラーの初期化
+frameStepLabeler = new FrameStepLabeler(featureLogger);
+
 
 // 仮想ポジション管理により動的に決定される現在の打鍵監視対象指 (targetFinger)
 export let currentTarget: TargetFinger = positionManager.assignTargetFinger(
@@ -309,11 +345,11 @@ function startTrackingLoop() {
       // 両手10本の指先トラッキング
       const rawHands = tracker.detect(videoElement, now);
 
-      // 人差し指局所相対運動特徴量の記録（RECオフ時は即座にリターンしオーバーヘッドなし）
-      featureLogger.processFrame(rawHands, now);
-
-      // 高速追従平滑化座標の算出
+      // 高速追従平滑化座標の算出 (One Euro Filter 3D)
       const smoothedHands = smoothHandFingertips(rawHands, now);
+
+      // 平滑化済み特徴量およびカメラ映像・骨格の記録（RECオフ時は即座にリターンしオーバーヘッドなし）
+      featureLogger.processFrame(smoothedHands, now, videoElement);
 
       // 学習データに基づく 1D-TCN モデル推論による人差し指打鍵検知（平滑化座標 smoothedHands を渡してノイズ排除）
       if (isCameraRunning) {
@@ -334,19 +370,72 @@ function startTrackingLoop() {
 }
 
 /**
- * 指先座標の平滑化処理 (1 Euro Filter 3D)
+ * 指先座標の平滑化処理 (1 Euro Filter 3D) および解剖学的誤吸着（テレポート）ガード
  */
 function smoothHandFingertips(
   hands: HandData[],
   timestamp: number,
 ): HandData[] {
   return hands.map((hand) => {
-    // 横画面空間位置の判定 (raw camera X > 0.46 は鏡像で画面左側 = 左手領域)
-    const isLeftZone = hand.centerX > 0.46 || hand.handedness === "Left";
-    const resolvedHandedness: "Left" | "Right" = isLeftZone ? "Left" : "Right";
+    // handTracker で安定推定された handedness を直接使用
+    const resolvedHandedness: "Left" | "Right" = hand.handedness === "Left" ? "Left" : "Right";
+
+    // スケール正規化基準長 L = ||Index MCP (5) - Wrist (0)||
+    const wrist = hand.allLandmarks[0];
+    const indexMcp = hand.allLandmarks[5];
+    const thumbTip = hand.allLandmarks[4];
+    const middleTip = hand.allLandmarks[12];
+    const rawIndexTip = hand.allLandmarks[8];
+
+    let L = 0.15;
+    if (wrist && indexMcp) {
+      L = Math.hypot(indexMcp.x - wrist.x, indexMcp.y - wrist.y, indexMcp.z - wrist.z) || 0.15;
+    }
+
+    // --- 人差し指(8)の解剖学的誤吸着（親指や中指へのテレポート）ガード ---
+    const relKey = `${resolvedHandedness}_rel_8`;
+    let safeIndexTip = rawIndexTip;
+
+    if (rawIndexTip && indexMcp) {
+      // Index MCP からのユークリッド相対距離（指の長さ）
+      const distToMcp = Math.hypot(rawIndexTip.x - indexMcp.x, rawIndexTip.y - indexMcp.y, rawIndexTip.z - indexMcp.z);
+      const normalizedLen = distToMcp / L;
+
+      // 親指先端(4)および中指先端(12)との距離
+      const distToThumb = thumbTip ? Math.hypot(rawIndexTip.x - thumbTip.x, rawIndexTip.y - thumbTip.y, rawIndexTip.z - thumbTip.z) / L : 999;
+      const distToMiddle = middleTip ? Math.hypot(rawIndexTip.x - middleTip.x, rawIndexTip.y - middleTip.y, rawIndexTip.z - middleTip.z) / L : 999;
+
+      // 誤吸着判定条件:
+      // 1. 指の長さが異常 (0.35 * L 未満 または 1.3 * L 超)
+      // 2. 親指先端に吸着 (距離が 0.28 * L 未満)
+      // 3. 中指先端に吸着 (距離が 0.10 * L 未満)
+      const isMcpDistanceInvalid = normalizedLen < 0.35 || normalizedLen > 1.3;
+      const isClusteredToThumb = distToThumb < 0.28;
+      const isClusteredToMiddle = distToMiddle < 0.10;
+
+      const isIndexAnatomicallyInvalid = isMcpDistanceInvalid || isClusteredToThumb || isClusteredToMiddle;
+
+      const lastRel = lastValidIndexRelMap.get(relKey);
+
+      if (isIndexAnatomicallyInvalid && lastRel) {
+        // 親指・中指への誤吸着または異常長さと判定:
+        // 現在の MCP(5) から直前の正常相対ベクトル方向に伸ばした安全な座標を採用
+        safeIndexTip = {
+          x: indexMcp.x + lastRel.x,
+          y: indexMcp.y + lastRel.y,
+          z: indexMcp.z + lastRel.z,
+        };
+      } else if (!isIndexAnatomicallyInvalid) {
+        // 正常な人差し指の運動: 正常相対ベクトルを更新
+        lastValidIndexRelMap.set(relKey, {
+          x: rawIndexTip.x - indexMcp.x,
+          y: rawIndexTip.y - indexMcp.y,
+          z: rawIndexTip.z - indexMcp.z,
+        });
+      }
+    }
 
     // 全ランドマークの平滑化 (One Euro Filter 3D)
-    // tcnTapDetector (Wrist:0, MCP:5, Tip:8) に渡す際のエッジ吸着ノイズ・座標跳躍を抑止
     const smoothedAllLandmarks = hand.allLandmarks.map((pt, idx) => {
       const key = `${resolvedHandedness}_lm_${idx}`;
       let filter = filterMap.get(key);
@@ -358,35 +447,21 @@ function smoothHandFingertips(
         });
         filterMap.set(key, filter);
       }
-      return filter.filter(pt, timestamp);
+
+      // 人差し指先端(8)は解剖学的ガード済みの safeIndexTip を入力
+      const inputPt = idx === 8 && safeIndexTip ? safeIndexTip : pt;
+      return filter.filter(inputPt, timestamp);
     });
 
+    // 指先座標は平滑化済みランドマークから直接抽出（全ランドマークとの座標完全一致を保証）
     const smoothedFingertips: FingertipCoord[] = hand.fingertips.map((tip) => {
-      const key = `${resolvedHandedness}_${tip.tipIndex}`;
-
-      // 各指先ごとの独立した 1 Euro Filter 3D インスタンス
-      let filter = filterMap.get(key);
-      if (!filter) {
-        filter = new OneEuroFilter3D({
-          minCutoff: 0.8,
-          beta: 4.0,
-          dCutoff: 1.0,
-        });
-        filterMap.set(key, filter);
-      }
-
-      // 座標平滑化 (急な振り下ろしにも遅延なく追従)
-      const smoothed = filter.filter(
-        { x: tip.x, y: tip.y, z: tip.z },
-        timestamp,
-      );
-
+      const smoothedPt = smoothedAllLandmarks[tip.tipIndex] ?? { x: tip.x, y: tip.y, z: tip.z };
       return {
         tipIndex: tip.tipIndex,
         name: tip.name,
-        x: smoothed.x,
-        y: smoothed.y,
-        z: smoothed.z,
+        x: smoothedPt.x,
+        y: smoothedPt.y,
+        z: smoothedPt.z,
       };
     });
 
@@ -443,61 +518,58 @@ function renderTracking(hands: HandData[], currentTimestamp: number) {
     canvasCtx.fill();
   }
 
-  // 2. 指先ポイントの描画（対象指のみ白黒二重丸で強調表示、他指は非表示）
-  hands.forEach((hand) => {
-    hand.fingertips.forEach((tip) => {
-      const px = tip.x * width;
-      const py = tip.y * height;
+  // 2. 指先ポイントの描画（主要対象手・人差し指のみを白黒二重丸で強調表示、他手・他指は一切描画しない）
+  const targetHand = hands.find((h) => h.handedness === 'Right') ?? hands[0];
+  if (targetHand) {
+    const targetTip = targetHand.fingertips.find((tip) => tip.tipIndex === 8);
+    if (targetTip) {
+      const px = targetTip.x * width;
+      const py = targetTip.y * height;
 
-      // 人差し指のみをターゲットリング強調表示
-      const isTarget = tip.tipIndex === 8;
-
-      const key = `${hand.handedness}_${tip.tipIndex}`;
+      const key = `${targetHand.handedness}_8`;
       const lastTapTime = recentTapMap.get(key) ?? -9999;
       const isRecentlyTapped = currentTimestamp - lastTapTime < 120;
 
-      if (isTarget) {
-        if (isRecentlyTapped) {
-          // 打鍵成功瞬間の高輝度白フラッシュ
-          canvasCtx.beginPath();
-          canvasCtx.arc(px, py, 18, 0, 2 * Math.PI);
-          canvasCtx.fillStyle = "#ffffff";
-          canvasCtx.fill();
-          canvasCtx.lineWidth = 3;
-          canvasCtx.strokeStyle = "#000000";
-          canvasCtx.stroke();
-        } else {
-          // 外側の黒枠白ターゲットリング
-          canvasCtx.beginPath();
-          canvasCtx.arc(px, py, 16, 0, 2 * Math.PI);
-          canvasCtx.lineWidth = 3;
-          canvasCtx.strokeStyle = "#000000";
-          canvasCtx.stroke();
+      if (isRecentlyTapped) {
+        // 打鍵成功瞬間の高輝度白フラッシュ
+        canvasCtx.beginPath();
+        canvasCtx.arc(px, py, 18, 0, 2 * Math.PI);
+        canvasCtx.fillStyle = "#ffffff";
+        canvasCtx.fill();
+        canvasCtx.lineWidth = 3;
+        canvasCtx.strokeStyle = "#000000";
+        canvasCtx.stroke();
+      } else {
+        // 外側の黒枠白ターゲットリング
+        canvasCtx.beginPath();
+        canvasCtx.arc(px, py, 16, 0, 2 * Math.PI);
+        canvasCtx.lineWidth = 3;
+        canvasCtx.strokeStyle = "#000000";
+        canvasCtx.stroke();
 
-          canvasCtx.beginPath();
-          canvasCtx.arc(px, py, 16, 0, 2 * Math.PI);
-          canvasCtx.lineWidth = 1.8;
-          canvasCtx.strokeStyle = "#ffffff";
-          canvasCtx.stroke();
+        canvasCtx.beginPath();
+        canvasCtx.arc(px, py, 16, 0, 2 * Math.PI);
+        canvasCtx.lineWidth = 1.8;
+        canvasCtx.strokeStyle = "#ffffff";
+        canvasCtx.stroke();
 
-          // 内側の白丸
-          canvasCtx.beginPath();
-          canvasCtx.arc(px, py, 7, 0, 2 * Math.PI);
-          canvasCtx.fillStyle = "#ffffff";
-          canvasCtx.fill();
-          canvasCtx.lineWidth = 2;
-          canvasCtx.strokeStyle = "#000000";
-          canvasCtx.stroke();
+        // 内側の白丸
+        canvasCtx.beginPath();
+        canvasCtx.arc(px, py, 7, 0, 2 * Math.PI);
+        canvasCtx.fillStyle = "#ffffff";
+        canvasCtx.fill();
+        canvasCtx.lineWidth = 2;
+        canvasCtx.strokeStyle = "#000000";
+        canvasCtx.stroke();
 
-          // 中心黒ドット
-          canvasCtx.beginPath();
-          canvasCtx.arc(px, py, 2, 0, 2 * Math.PI);
-          canvasCtx.fillStyle = "#000000";
-          canvasCtx.fill();
-        }
+        // 中心黒ドット
+        canvasCtx.beginPath();
+        canvasCtx.arc(px, py, 2, 0, 2 * Math.PI);
+        canvasCtx.fillStyle = "#000000";
+        canvasCtx.fill();
       }
-    });
-  });
+    }
+  }
 
   // テキストUIは完全削除（renderTargetHUDなし）
 }
@@ -524,6 +596,16 @@ recBtn.addEventListener("click", (e) => {
     loggerStatusIndicator.classList.remove("recording");
   }
 });
+
+// レビューボタン
+if (reviewOpenBtn) {
+  reviewOpenBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (frameStepLabeler && featureLogger.frames.length > 0) {
+      frameStepLabeler.open(featureLogger.frames);
+    }
+  });
+}
 
 // JSON保存
 exportBtn.addEventListener("click", (e) => {
@@ -561,7 +643,7 @@ hitBtn.addEventListener("pointercancel", (e) => {
   deactivateHit();
 });
 
-// 画面タップによるHIT操作（他ボタン操作時やHUD操作時は除外）
+// 画面タップによるHIT操作（他ボタン操作時やHUD・レビューモーダル操作時は除外）
 window.addEventListener("pointerdown", (e) => {
   pianoSynth.ensureContext();
 
@@ -570,7 +652,8 @@ window.addEventListener("pointerdown", (e) => {
     target &&
     (target.closest("button") ||
       target.closest(".logger-panel") ||
-      target.closest(".debug-hud"))
+      target.closest(".debug-hud") ||
+      target.closest(".review-modal"))
   ) {
     return;
   }
@@ -597,6 +680,26 @@ if (sliderProb && valProb) {
     const val = parseFloat(sliderProb.value);
     valProb.textContent = val.toFixed(2);
     tcnDetector.setMinProb(val);
+  });
+}
+
+// 手首高さ閾値スライダー (空中キャンセルガード)
+if (sliderWrist && valWrist) {
+  sliderWrist.addEventListener("input", (e) => {
+    e.stopPropagation();
+    const val = parseFloat(sliderWrist.value);
+    valWrist.textContent = val <= 0.001 ? "0.00 (OFF)" : val.toFixed(2);
+    tcnDetector.setMinWristY(val);
+  });
+}
+
+// 打鍵深さ閾値スライダー
+if (sliderDepth && valDepth) {
+  sliderDepth.addEventListener("input", (e) => {
+    e.stopPropagation();
+    const val = parseFloat(sliderDepth.value);
+    valDepth.textContent = val.toFixed(2);
+    tcnDetector.setMinDepth(val);
   });
 }
 
@@ -638,8 +741,13 @@ window.addEventListener("pointercancel", (e) => {
   }
 });
 
-// Spaceキー操作（押下中 HIT、離すと解除）
+// Spaceキー操作（レビューモーダル表示中はモーダル側のショートカットを優先）
+const reviewModalEl = document.getElementById("review-modal");
+
 window.addEventListener("keydown", (e) => {
+  if (reviewModalEl && !reviewModalEl.classList.contains("hidden")) {
+    return;
+  }
   if (e.code === "Space" && !e.repeat) {
     e.preventDefault();
     activateHit();
@@ -647,6 +755,9 @@ window.addEventListener("keydown", (e) => {
 });
 
 window.addEventListener("keyup", (e) => {
+  if (reviewModalEl && !reviewModalEl.classList.contains("hidden")) {
+    return;
+  }
   if (e.code === "Space") {
     e.preventDefault();
     deactivateHit();

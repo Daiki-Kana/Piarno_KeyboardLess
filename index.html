@@ -26,7 +26,11 @@
             <span class="hud-sep">|</span>
             <span id="hud-prob">Prob: 0.0%</span>
             <span class="hud-sep">|</span>
-            <span id="hud-decel">Decel: 0.00</span>
+            <span id="hud-depth">Depth(ry): 0.00</span>
+            <span class="hud-sep">|</span>
+            <span id="hud-wrist">WristY: 0.00</span>
+            <span class="hud-sep">|</span>
+            <span id="hud-peak">Peak: -</span>
             <span class="hud-sep">|</span>
             <span id="hud-tap-count">Tap Count: 0</span>
           </div>
@@ -39,17 +43,33 @@
             <div class="hud-slider-group">
               <div class="hud-slider-header">
                 <label for="slider-prob">TCN 確率閾値</label>
-                <span id="val-prob" class="hud-slider-val">0.50</span>
+                <span id="val-prob" class="hud-slider-val">0.25</span>
               </div>
-              <input type="range" id="slider-prob" min="0.30" max="0.95" step="0.05" value="0.50" />
+              <input type="range" id="slider-prob" min="0.10" max="0.90" step="0.05" value="0.25" />
+            </div>
+
+            <div class="hud-slider-group">
+              <div class="hud-slider-header">
+                <label for="slider-wrist">手首高さ閾値 (空中ガード)</label>
+                <span id="val-wrist" class="hud-slider-val">0.45</span>
+              </div>
+              <input type="range" id="slider-wrist" min="0.00" max="0.80" step="0.05" value="0.45" />
+            </div>
+
+            <div class="hud-slider-group">
+              <div class="hud-slider-header">
+                <label for="slider-depth">打鍵深さ閾値 (ry)</label>
+                <span id="val-depth" class="hud-slider-val">0.15</span>
+              </div>
+              <input type="range" id="slider-depth" min="0.00" max="0.50" step="0.05" value="0.15" />
             </div>
 
             <div class="hud-slider-group">
               <div class="hud-slider-header">
                 <label for="slider-decel">減速閾値 (0で無効)</label>
-                <span id="val-decel" class="hud-slider-val">0.30</span>
+                <span id="val-decel" class="hud-slider-val">0.00 (OFF)</span>
               </div>
-              <input type="range" id="slider-decel" min="0.0" max="3.0" step="0.1" value="0.3" />
+              <input type="range" id="slider-decel" min="0.0" max="3.0" step="0.1" value="0.0" />
             </div>
 
             <div class="hud-slider-group">
@@ -91,7 +111,69 @@
         <div class="logger-controls">
           <button id="rec-btn" class="logger-btn rec-btn" type="button">REC</button>
           <button id="hit-btn" class="logger-btn hit-btn" type="button">HIT (Space)</button>
+          <button id="review-open-btn" class="logger-btn review-open-btn" type="button" disabled>レビュー</button>
           <button id="export-btn" class="logger-btn export-btn" type="button" disabled>JSON保存</button>
+        </div>
+      </div>
+
+      <!-- 白黒ミニマル コマ送り手動ラベリングモーダル -->
+      <div id="review-modal" class="review-modal hidden">
+        <div class="review-container">
+          <!-- ヘッダー -->
+          <div class="review-header">
+            <div class="review-header-left">
+              <span class="review-title">FRAME-STEP LABELER</span>
+              <span id="review-hit-badge" class="review-hit-badge">0 HITS MARKED</span>
+            </div>
+            <button id="review-close-btn" class="review-btn review-close-btn" type="button">✕ 閉じる / 再録画</button>
+          </div>
+
+          <!-- プレビュー映像エリア -->
+          <div class="review-viewport">
+            <canvas id="review-canvas" class="review-canvas"></canvas>
+            <div id="review-overlay-badge" class="review-overlay-badge">NORMAL</div>
+            <div id="review-metrics-hud" class="review-metrics-hud">
+              <span id="review-feat-pos">Pos: [0.00, 0.00, 0.00]</span>
+              <span class="review-hud-sep">|</span>
+              <span id="review-feat-vel">Vel: [0.00, 0.00, 0.00]</span>
+            </div>
+          </div>
+
+          <!-- タイムライン & シークバー -->
+          <div class="review-timeline-wrapper">
+            <canvas id="review-timeline-canvas" class="review-timeline-canvas"></canvas>
+            <input type="range" id="review-seekbar" class="review-seekbar" min="0" max="0" value="0" step="1" />
+          </div>
+
+          <!-- コマ送り・マーク操作コントロール -->
+          <div class="review-controls">
+            <div class="review-nav-group">
+              <button id="review-prev5-btn" class="review-btn" type="button" title="5フレーム戻る">◀◀ -5F</button>
+              <button id="review-prev-btn" class="review-btn" type="button" title="1フレーム戻る">◀ -1F</button>
+              <div id="review-frame-counter" class="review-frame-counter">Frame: 0 / 0</div>
+              <button id="review-next-btn" class="review-btn" type="button" title="1フレーム進む">+1F ▶</button>
+              <button id="review-next5-btn" class="review-btn" type="button" title="5フレーム進む">+5F ▶▶</button>
+            </div>
+
+            <div class="review-action-group">
+              <button id="review-mark-btn" class="review-btn review-mark-btn" type="button">
+                <span class="mark-icon">●</span> <span id="review-mark-text">打鍵指定 (Mark Hit)</span>
+              </button>
+            </div>
+
+            <div class="review-export-group">
+              <button id="review-export-json-btn" class="review-btn export-action-btn" type="button">JSON保存</button>
+              <button id="review-export-csv-btn" class="review-btn export-action-btn" type="button">CSV保存</button>
+            </div>
+          </div>
+
+          <!-- キーボードショートカット操作ヘルプ -->
+          <div class="review-shortcut-help">
+            <span>[← / →]: 1Fコマ送り</span>
+            <span>[Shift + ← / →]: 5F送り</span>
+            <span>[Space / M]: 打鍵マークトグル</span>
+            <span>[Esc]: 閉じる</span>
+          </div>
         </div>
       </div>
     </div>
