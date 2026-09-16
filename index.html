@@ -18,11 +18,81 @@
       <video id="webcam" autoplay playsinline webkit-playsinline muted></video>
       <canvas id="output-canvas"></canvas>
 
+      <!-- 画面上端の推論デバッグHUD (白黒シンプル・折りたたみ対応) -->
+      <div id="debug-hud" class="debug-hud">
+        <div class="hud-main-bar">
+          <div class="hud-metrics">
+            <span id="hud-tcn-ready">TCN Ready: false</span>
+            <span class="hud-sep">|</span>
+            <span id="hud-prob">Prob: 0.0%</span>
+            <span class="hud-sep">|</span>
+            <span id="hud-decel">Decel: 0.00</span>
+            <span class="hud-sep">|</span>
+            <span id="hud-tap-count">Tap Count: 0</span>
+          </div>
+          <button id="hud-toggle-btn" class="hud-toggle-btn" type="button">調整 ▼</button>
+        </div>
+
+        <!-- 折りたたみ式 調整スライダー＆直近ログパネル -->
+        <div id="hud-panel" class="hud-panel hidden">
+          <div class="hud-controls-grid">
+            <div class="hud-slider-group">
+              <div class="hud-slider-header">
+                <label for="slider-prob">TCN 確率閾値</label>
+                <span id="val-prob" class="hud-slider-val">0.50</span>
+              </div>
+              <input type="range" id="slider-prob" min="0.30" max="0.95" step="0.05" value="0.50" />
+            </div>
+
+            <div class="hud-slider-group">
+              <div class="hud-slider-header">
+                <label for="slider-decel">減速閾値 (0で無効)</label>
+                <span id="val-decel" class="hud-slider-val">0.30</span>
+              </div>
+              <input type="range" id="slider-decel" min="0.0" max="3.0" step="0.1" value="0.3" />
+            </div>
+
+            <div class="hud-slider-group">
+              <div class="hud-slider-header">
+                <label for="slider-cooldown">クールダウン</label>
+                <span id="val-cooldown" class="hud-slider-val">100ms</span>
+              </div>
+              <input type="range" id="slider-cooldown" min="50" max="250" step="10" value="100" />
+            </div>
+          </div>
+
+          <div class="hud-logs-section">
+            <div class="hud-logs-title">直近打鍵トリガー (最新3件)</div>
+            <div id="hud-logs-list" class="hud-logs-list">
+              <div class="hud-log-item empty">- 打鍵待機中 -</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- 起動・カウントダウン用ミニマルオーバーレイ -->
       <div id="start-overlay" class="overlay">
         <button id="camera-btn" class="minimal-btn" disabled>初期化中...</button>
         <button id="countdown-btn" class="minimal-btn" style="display: none;">スタート</button>
         <div id="countdown-display" class="countdown-text"></div>
+      </div>
+
+      <!-- 白黒基調 データ収集UIパネル -->
+      <div id="logger-panel" class="logger-panel">
+        <div class="logger-header">
+          <span class="logger-title">INDEX FEATURE LOGGER</span>
+          <span id="logger-status-indicator" class="logger-status-indicator">IDLE</span>
+        </div>
+        <div class="logger-stats">
+          <div class="stat-item"><span class="stat-label">FRAMES</span><span id="stat-frames" class="stat-val">0</span></div>
+          <div class="stat-item"><span class="stat-label">HITS</span><span id="stat-hits" class="stat-val">0</span></div>
+          <div class="stat-item"><span class="stat-label">HAND</span><span id="stat-hand" class="stat-val">-</span></div>
+        </div>
+        <div class="logger-controls">
+          <button id="rec-btn" class="logger-btn rec-btn" type="button">REC</button>
+          <button id="hit-btn" class="logger-btn hit-btn" type="button">HIT (Space)</button>
+          <button id="export-btn" class="logger-btn export-btn" type="button" disabled>JSON保存</button>
+        </div>
       </div>
     </div>
 
