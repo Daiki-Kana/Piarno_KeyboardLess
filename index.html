@@ -18,6 +18,43 @@
       <video id="webcam" autoplay playsinline webkit-playsinline muted></video>
       <canvas id="output-canvas"></canvas>
 
+      <!-- 喜びの歌 5指打鍵HUD（白黒ミニマル） -->
+      <div id="debug-controls" class="debug-controls">
+        <div class="song-hud">
+          <div class="song-header">
+            <span class="song-badge">右手5指</span>
+            <span class="song-title">喜びの歌（歓喜の歌）</span>
+            <span id="hud-progress" class="hud-progress">1 / 15</span>
+          </div>
+          <div class="hud-status-bar">
+            <div class="hud-status-col">
+              <span class="hud-sublabel">指定指:</span>
+              <span id="hud-finger" class="hud-target-highlight">中指 (MIDDLE)</span>
+            </div>
+            <div class="hud-status-col">
+              <span class="hud-sublabel">音名:</span>
+              <span id="hud-note" class="hud-target-note">E4 (ミ)</span>
+            </div>
+            <div class="hud-status-col">
+              <span class="hud-sublabel">ステート:</span>
+              <span id="debug-state" class="state-badge state-idle">IDLE</span>
+            </div>
+          </div>
+        </div>
+
+        <div id="debug-info" class="debug-info">
+          <span id="debug-scale">L_hand: --</span>
+          <span id="debug-line">Line_Y: --</span>
+          <span id="debug-depth">追従深さ: --</span>
+          <div class="offset-adjuster">
+            <span class="adjust-label">直下オフセット:</span>
+            <button id="btn-offset-dec" class="adjust-btn" title="指に近づける">−</button>
+            <span id="offset-val">50%</span>
+            <button id="btn-offset-inc" class="adjust-btn" title="指から離す">＋</button>
+          </div>
+        </div>
+      </div>
+
       <!-- 起動・カウントダウン用ミニマルオーバーレイ -->
       <div id="start-overlay" class="overlay">
         <button id="camera-btn" class="minimal-btn" disabled>初期化中...</button>

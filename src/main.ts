@@ -1,9 +1,12 @@
-import { HandTracker, HandData, FingertipCoord } from './handTracker';
-import { OneEuroFilter3D } from './oneEuroFilter';
-import { TapDetector, TapEvent } from './tapDetector';
+import { HandTracker, HandData } from './handTracker';
 import { PianoSynth } from './pianoSynth';
 import { SongSequencer } from './songSequencer';
-import { VirtualPositionManager, TargetFinger } from './virtualPositionManager';
+import {
+  AnchorLineTracker,
+  AnchorLineResult,
+  FingertipLandmarkIndex,
+  getAnchorTipIndex,
+} from './anchorLineTracker';
 
 // DOM 要素
 const videoElement = document.getElementById('webcam') as HTMLVideoElement;
@@ -14,15 +17,18 @@ const cameraBtn = document.getElementById('camera-btn') as HTMLButtonElement;
 const countdownBtn = document.getElementById('countdown-btn') as HTMLButtonElement;
 const countdownDisplay = document.getElementById('countdown-display') as HTMLElement;
 
+// 演奏HUD要素
+const hudFingerEl = document.getElementById('hud-finger');
+const hudNoteEl = document.getElementById('hud-note');
+const hudProgressEl = document.getElementById('hud-progress');
+
 const tracker = new HandTracker();
-const tapDetector = new TapDetector();
 const pianoSynth = new PianoSynth();
 const sequencer = new SongSequencer();
-const positionManager = new VirtualPositionManager('C4', 'C4');
-const filterMap = new Map<string, OneEuroFilter3D>();
+const anchorTracker = new AnchorLineTracker();
 
-// 仮想ポジション管理により動的に決定される現在の打鍵監視対象指 (targetFinger)
-let currentTarget: TargetFinger = positionManager.assignTargetFinger(sequencer.getCurrentNote());
+let currentAnchorResult: AnchorLineResult | null = null;
+
 
 // 打鍵波紋エフェクト情報
 interface VisualTapRipple {
@@ -33,15 +39,14 @@ interface VisualTapRipple {
   velocity: number;
 }
 const activeRipples: VisualTapRipple[] = [];
-
-// 直近の打鍵時刻を保持（指先フラッシュ表示用）
-const recentTapMap = new Map<string, number>();
+let recentHitTimestamp = -9999;
 
 let isCameraRunning = false;
 let isStartingCamera = false;
 let isPlaying = false;
 let mediaStream: MediaStream | null = null;
-let lastTimestamp = -1;
+
+
 
 /**
  * 初期化処理
@@ -132,7 +137,6 @@ async function startCamera() {
     countdownBtn.style.display = 'block';
     countdownBtn.textContent = 'スタート';
 
-    lastTimestamp = -1;
     startTrackingLoop();
   } catch (err) {
     console.error('Webカメラ取得失敗:', err);
@@ -149,6 +153,9 @@ async function startCamera() {
 async function startCountdown() {
   if (!isCameraRunning || isPlaying) return;
 
+  // オーディオコンテキストを確実にアクティブ化
+  await pianoSynth.ensureContext();
+
   countdownBtn.style.display = 'none';
   countdownDisplay.classList.add('show');
 
@@ -162,151 +169,164 @@ async function startCountdown() {
   startOverlay.classList.add('hidden');
   countdownDisplay.classList.remove('show');
   isPlaying = true;
-  lastTimestamp = -1;
 }
 
 /**
  * 超低遅延トラッキング描画ループ
+ * requestVideoFrameCallback を活用し、カメラ映像のフレーム更新と完全同期させて遅延を極限まで排除
  */
 function startTrackingLoop() {
-  const loop = () => {
+  const onFrame = () => {
     if (!isCameraRunning) return;
 
     const now = performance.now();
 
-    if (videoElement.currentTime !== lastTimestamp) {
-      lastTimestamp = videoElement.currentTime;
-
-      // 解像度変化（端末の回転等）への追従
-      if (
-        videoElement.videoWidth > 0 &&
-        (canvasElement.width !== videoElement.videoWidth ||
-          canvasElement.height !== videoElement.videoHeight)
-      ) {
-        canvasElement.width = videoElement.videoWidth;
-        canvasElement.height = videoElement.videoHeight;
-      }
-
-      // 両手10本の指先トラッキング
-      const rawHands = tracker.detect(videoElement, now);
-
-      // 高速追従平滑化座標および打鍵検知
-      const smoothedHands = processHandsAndDetectTaps(rawHands, now);
-
-      // Canvasにターゲットのみ強調描画（テキストUIは完全非表示）
-      renderTracking(smoothedHands, now);
+    // 解像度変化（端末の回転等）への追従
+    if (
+      videoElement.videoWidth > 0 &&
+      (canvasElement.width !== videoElement.videoWidth ||
+        canvasElement.height !== videoElement.videoHeight)
+    ) {
+      canvasElement.width = videoElement.videoWidth;
+      canvasElement.height = videoElement.videoHeight;
     }
 
-    requestAnimationFrame(loop);
-  };
+    // MediaPipeによる最新フレームの生トラッキング
+    const rawHands = tracker.detect(videoElement, now);
 
-  requestAnimationFrame(loop);
-}
+    // シーケンサーから現在のターゲット音符・指を取得
+    const currentNote = sequencer.getCurrentNote();
+    const targetTipIndex: FingertipLandmarkIndex =
+      (currentNote.targetFingerTipIndex as FingertipLandmarkIndex) ?? 12;
+    const targetHand: 'Right' | 'Left' = (currentNote.hand as 'Right' | 'Left') ?? 'Right';
 
-/**
- * 指先座標を平滑化し、打鍵を検知
- * 左手・右手それぞれの打鍵不発を防ぐため、指定指に加えて同手の主要指もフォールバック監視
- */
-function processHandsAndDetectTaps(hands: HandData[], timestamp: number): HandData[] {
-  let noteTriggeredInThisFrame = false;
+    // 指定された手の相互アンカー追従ラインおよびステートマシン判定を計算
+    currentAnchorResult = null;
+    let activeHandData = rawHands.find((h) => h.handedness === targetHand);
+    // 片手のみ検出されている場合は、左右判定のブレによる不発を防ぐためその手を対象とする
+    if (!activeHandData && rawHands.length === 1) {
+      activeHandData = rawHands[0];
+    }
 
-  return hands.map((hand) => {
-    // 横画面空間位置の判定 (raw camera X > 0.46 は鏡像で画面左側 = 左手領域)
-    const isLeftZone = hand.centerX > 0.46 || hand.handedness === 'Left';
-    const resolvedHandedness: 'Left' | 'Right' = isLeftZone ? 'Left' : 'Right';
-    const isTargetHand = resolvedHandedness === currentTarget.handedness;
+    if (activeHandData && activeHandData.allLandmarks) {
+      currentAnchorResult = anchorTracker.calculateLine(
+        activeHandData.allLandmarks,
+        targetTipIndex,
+        canvasElement.width,
+        canvasElement.height,
+        now
+      );
 
-    const smoothedFingertips: FingertipCoord[] = hand.fingertips.map((tip) => {
-      const key = `${resolvedHandedness}_${tip.tipIndex}`;
+      // HIT 検知時の発音およびシーケンサー連携（非指定指は完全にマスク）
+      if (currentAnchorResult && currentAnchorResult.tapEvaluation.isHit) {
+        const velocity = currentAnchorResult.tapEvaluation.velocity;
 
-      // 各指先ごとの独立した 1 Euro Filter 3D インスタンス
-      let filter = filterMap.get(key);
-      if (!filter) {
-        filter = new OneEuroFilter3D({ minCutoff: 0.8, beta: 4.0, dCutoff: 1.0 });
-        filterMap.set(key, filter);
-      }
+        // Web Audio API のコンテキストを確実に再開して発音
+        pianoSynth.ensureContext();
+        if (currentNote.chord && currentNote.chord.length > 0) {
+          pianoSynth.playChord(currentNote.chord as number[], velocity);
+        } else {
+          pianoSynth.playNote(currentNote.frequency, velocity);
+        }
 
-      // 座標平滑化 (急な振り下ろしにも遅延なく追従)
-      const smoothed = filter.filter({ x: tip.x, y: tip.y, z: tip.z }, timestamp);
-
-      // 該当指（targetFinger）かどうか
-      const isTargetFinger = isTargetHand && tip.tipIndex === currentTarget.tipIndex;
-
-      // 演奏中かつ対象手の場合の打鍵判定:
-      // 1. 指定ターゲット指 (親指等)
-      // 2. 左手/右手の打鍵不発を完全に防止するため、同手の親指(4)・人差指(8)・中指(12)もフォールバック判定
-      const canEvaluateTap =
-        isPlaying &&
-        !noteTriggeredInThisFrame &&
-        (isTargetFinger || (isTargetHand && (tip.tipIndex === 4 || tip.tipIndex === 8 || tip.tipIndex === 12)));
-
-      if (canEvaluateTap) {
-        const tapEvent: TapEvent | null = tapDetector.processFingertip(
-          resolvedHandedness,
-          tip.tipIndex,
-          tip.name,
-          smoothed.x,
-          smoothed.y,
-          smoothed.z,
-          timestamp
+        console.log(
+          `[HIT 打鍵成功] ${currentNote.targetFingerLabel} (${currentNote.targetFingerName}) -> ` +
+          `♪ ${currentNote.solfege}(${currentNote.pitch}, ${currentNote.frequency.toFixed(1)}Hz)`
         );
 
-        if (tapEvent) {
-          // 現在の音符を即座に発音 (和音コード指定時は重厚なピアノ伴奏、単音時はメロディ)
-          const currentNote = sequencer.getCurrentNote();
-          if (currentNote.chord && currentNote.chord.length > 0) {
-            pianoSynth.playChord(currentNote.chord as number[], tapEvent.velocity);
-          } else {
-            pianoSynth.playNote(currentNote.frequency, tapEvent.velocity);
-          }
+        recentHitTimestamp = now;
 
-          console.log(
-            `[Tap 発音成功] ${resolvedHandedness}手 ${tip.name} -> ` +
-            `♪ ${currentNote.solfege}(${currentNote.pitch}, ${currentNote.frequency.toFixed(1)}Hz)`
-          );
+        // 打鍵波紋エフェクト
+        activeRipples.push({
+          x: currentAnchorResult.targetX / canvasElement.width,
+          y: currentAnchorResult.targetY / canvasElement.height,
+          startTime: now,
+          duration: 280,
+          velocity,
+        });
 
-          // 打鍵波紋エフェクト
-          activeRipples.push({
-            x: smoothed.x,
-            y: smoothed.y,
-            startTime: timestamp,
-            duration: 260,
-            velocity: tapEvent.velocity,
-          });
-
-          // 打鍵直後フラッシュ用タイムスタンプ記憶
-          recentTapMap.set(key, timestamp);
-
-          // シーケンサーを1音前進
-          const { nextNote } = sequencer.advance();
-
-          // 次のターゲット指を決定
-          currentTarget = positionManager.assignTargetFinger(nextNote);
-        }
+        // シーケンサーを1音前進（末尾到達時は先頭へ自動ループ）
+        sequencer.advance();
+        anchorTracker.resetState();
       }
+    }
 
-      return {
-        tipIndex: tip.tipIndex,
-        name: tip.name,
-        x: smoothed.x,
-        y: smoothed.y,
-        z: smoothed.z,
-      };
-    });
+    // 次のターゲット音符・指情報でHUDと描画ターゲットを即時更新
+    const activeNote = sequencer.getCurrentNote();
+    const activeTip: FingertipLandmarkIndex =
+      (activeNote.targetFingerTipIndex as FingertipLandmarkIndex) ?? 12;
+    const activeHand: 'Right' | 'Left' = (activeNote.hand as 'Right' | 'Left') ?? 'Right';
 
-    return {
-      ...hand,
-      handedness: resolvedHandedness,
-      fingertips: smoothedFingertips,
-    };
+    // HUD表示のリアルタイム更新
+    if (hudFingerEl) {
+      hudFingerEl.textContent = `${activeNote.targetFingerLabel} (${activeNote.targetFingerName})`;
+    }
+    if (hudNoteEl) {
+      hudNoteEl.textContent = `${activeNote.pitch} (${activeNote.solfege})`;
+    }
+    if (hudProgressEl) {
+      hudProgressEl.textContent = `${sequencer.getCurrentIndex() + 1} / ${sequencer.getTotalNotes()}`;
+    }
+
+    // Canvasに相互アンカー追従ライン、指先、ステート、波紋を描画（次の指を即時反映）
+    renderTracking(rawHands, now, currentAnchorResult, activeTip, activeHand);
+
+    // 次フレームの同期要求
+    if ('requestVideoFrameCallback' in videoElement) {
+      videoElement.requestVideoFrameCallback(onFrame);
+    } else {
+      requestAnimationFrame(onFrame);
+    }
+  };
+
+  if ('requestVideoFrameCallback' in videoElement) {
+    videoElement.requestVideoFrameCallback(onFrame);
+  } else {
+    requestAnimationFrame(onFrame);
+  }
+}
+
+// デバッグ数値・オフセット調整・ステート用 DOM 要素
+const debugStateEl = document.getElementById('debug-state');
+const debugScaleEl = document.getElementById('debug-scale');
+const debugLineEl = document.getElementById('debug-line');
+const debugDepthEl = document.getElementById('debug-depth');
+const offsetValEl = document.getElementById('offset-val');
+const btnOffsetInc = document.getElementById('btn-offset-inc');
+const btnOffsetDec = document.getElementById('btn-offset-dec');
+
+let currentOffsetRatio = 0.50;
+
+// オフセット微調整ボタンのイベント
+if (btnOffsetInc) {
+  btnOffsetInc.addEventListener('click', (e) => {
+    e.stopPropagation();
+    currentOffsetRatio = Math.min(0.80, Math.round((currentOffsetRatio + 0.01) * 100) / 100);
+    anchorTracker.setOffsetRatio(currentOffsetRatio);
+    if (offsetValEl) offsetValEl.textContent = `${Math.round(currentOffsetRatio * 100)}%`;
+  });
+}
+
+if (btnOffsetDec) {
+  btnOffsetDec.addEventListener('click', (e) => {
+    e.stopPropagation();
+    currentOffsetRatio = Math.max(0.01, Math.round((currentOffsetRatio - 0.01) * 100) / 100);
+    anchorTracker.setOffsetRatio(currentOffsetRatio);
+    if (offsetValEl) offsetValEl.textContent = `${Math.round(currentOffsetRatio * 100)}%`;
   });
 }
 
 /**
- * Canvas描画: targetFinger のみを白黒丸マークで強調表示し、打鍵時に波紋フィードバック
- * テキストUIは一切描画せず、純粋な視覚フィードバックのみを提供
+ * Canvas描画:
+ * 現在のターゲット指（Index / Middle）の直下に張り付く Line_Y をステートに応じた白黒デザインで描画
  */
-function renderTracking(hands: HandData[], currentTimestamp: number) {
+function renderTracking(
+  hands: HandData[],
+  currentTimestamp: number,
+  anchorResult: AnchorLineResult | null,
+  targetTipIndex: FingertipLandmarkIndex,
+  targetHand: 'Right' | 'Left'
+) {
   canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
 
   const width = canvasElement.width;
@@ -325,8 +345,8 @@ function renderTracking(hands: HandData[], currentTimestamp: number) {
 
     const rx = ripple.x * width;
     const ry = ripple.y * height;
-    const baseRadius = 10;
-    const maxRadius = 42 + ripple.velocity * 18;
+    const baseRadius = 8;
+    const maxRadius = 38 + ripple.velocity * 16;
     const currentRadius = baseRadius + (maxRadius - baseRadius) * Math.sin((progress * Math.PI) / 2);
     const alpha = (1.0 - progress) * 0.9;
 
@@ -334,73 +354,223 @@ function renderTracking(hands: HandData[], currentTimestamp: number) {
     canvasCtx.beginPath();
     canvasCtx.arc(rx, ry, currentRadius, 0, 2 * Math.PI);
     canvasCtx.strokeStyle = `rgba(255, 255, 255, ${alpha.toFixed(3)})`;
-    canvasCtx.lineWidth = 2.5 * (1.0 - progress * 0.4);
+    canvasCtx.lineWidth = 2.0 * (1.0 - progress * 0.3);
     canvasCtx.stroke();
 
-    // 内側の微かな光
+    // 内側の淡い白光
     canvasCtx.beginPath();
-    canvasCtx.arc(rx, ry, currentRadius * 0.65, 0, 2 * Math.PI);
-    canvasCtx.fillStyle = `rgba(255, 255, 255, ${(alpha * 0.25).toFixed(3)})`;
+    canvasCtx.arc(rx, ry, currentRadius * 0.6, 0, 2 * Math.PI);
+    canvasCtx.fillStyle = `rgba(255, 255, 255, ${(alpha * 0.2).toFixed(3)})`;
     canvasCtx.fill();
   }
 
-  // 2. 指先ポイントの描画（対象指のみ白黒二重丸で強調表示、他指は非表示）
+  // 2. 各指先の位置を描画
+  const isRecentlyHit = currentTimestamp - recentHitTimestamp < 140;
+  const anchorTipIndex = getAnchorTipIndex(targetTipIndex);
+
   hands.forEach((hand) => {
+    const isTargetHand = hand.handedness === targetHand;
+
     hand.fingertips.forEach((tip) => {
       const px = tip.x * width;
       const py = tip.y * height;
+      const isTargetFinger = isTargetHand && tip.tipIndex === targetTipIndex;
+      const isAnchorFinger = isTargetHand && tip.tipIndex === anchorTipIndex;
 
-      const isTarget =
-        hand.handedness === currentTarget.handedness && tip.tipIndex === currentTarget.tipIndex;
-
-      const key = `${hand.handedness}_${tip.tipIndex}`;
-      const lastTapTime = recentTapMap.get(key) ?? -9999;
-      const isRecentlyTapped = currentTimestamp - lastTapTime < 120;
-
-      if (isTarget) {
-        if (isRecentlyTapped) {
+      if (isTargetFinger) {
+        if (isRecentlyHit) {
           // 打鍵成功瞬間の高輝度白フラッシュ
           canvasCtx.beginPath();
-          canvasCtx.arc(px, py, 18, 0, 2 * Math.PI);
+          canvasCtx.arc(px, py, 16, 0, 2 * Math.PI);
           canvasCtx.fillStyle = '#ffffff';
           canvasCtx.fill();
           canvasCtx.lineWidth = 3;
           canvasCtx.strokeStyle = '#000000';
           canvasCtx.stroke();
         } else {
-          // 外側の黒枠白ターゲットリング
+          // 通常時の指定ターゲット指マーク（白黒二重丸）
           canvasCtx.beginPath();
-          canvasCtx.arc(px, py, 16, 0, 2 * Math.PI);
+          canvasCtx.arc(px, py, 14, 0, 2 * Math.PI);
           canvasCtx.lineWidth = 3;
           canvasCtx.strokeStyle = '#000000';
           canvasCtx.stroke();
 
           canvasCtx.beginPath();
-          canvasCtx.arc(px, py, 16, 0, 2 * Math.PI);
-          canvasCtx.lineWidth = 1.8;
+          canvasCtx.arc(px, py, 14, 0, 2 * Math.PI);
+          canvasCtx.lineWidth = 1.5;
           canvasCtx.strokeStyle = '#ffffff';
           canvasCtx.stroke();
 
-          // 内側の白丸
+          // 中心白丸
           canvasCtx.beginPath();
-          canvasCtx.arc(px, py, 7, 0, 2 * Math.PI);
+          canvasCtx.arc(px, py, 4, 0, 2 * Math.PI);
           canvasCtx.fillStyle = '#ffffff';
           canvasCtx.fill();
-          canvasCtx.lineWidth = 2;
-          canvasCtx.strokeStyle = '#000000';
-          canvasCtx.stroke();
-
-          // 中心黒ドット
-          canvasCtx.beginPath();
-          canvasCtx.arc(px, py, 2, 0, 2 * Math.PI);
-          canvasCtx.fillStyle = '#000000';
-          canvasCtx.fill();
         }
+      } else if (isAnchorFinger) {
+        // アンカー指の先端マーク（細い黒枠灰丸＋十字）
+        canvasCtx.beginPath();
+        canvasCtx.arc(px, py, 7, 0, 2 * Math.PI);
+        canvasCtx.lineWidth = 2.5;
+        canvasCtx.strokeStyle = '#000000';
+        canvasCtx.stroke();
+
+        canvasCtx.beginPath();
+        canvasCtx.arc(px, py, 7, 0, 2 * Math.PI);
+        canvasCtx.lineWidth = 1.2;
+        canvasCtx.strokeStyle = '#aaaaaa';
+        canvasCtx.stroke();
+
+        // 十字マーク
+        canvasCtx.beginPath();
+        canvasCtx.moveTo(px - 4, py);
+        canvasCtx.lineTo(px + 4, py);
+        canvasCtx.moveTo(px, py - 4);
+        canvasCtx.lineTo(px, py + 4);
+        canvasCtx.lineWidth = 1.2;
+        canvasCtx.strokeStyle = '#ffffff';
+        canvasCtx.stroke();
+      } else if (isTargetHand && [4, 8, 12, 16, 20].includes(tip.tipIndex)) {
+        // 対象手だが非ターゲット・非アンカーの指（薄いグレーのドット）
+        canvasCtx.beginPath();
+        canvasCtx.arc(px, py, 3, 0, 2 * Math.PI);
+        canvasCtx.fillStyle = '#444444';
+        canvasCtx.fill();
       }
     });
   });
 
-  // テキストUIは完全削除（renderTargetHUDなし）
+  // 3. 相互アンカー追従ライン（Line_Y）のリアルタイム描画（ステート別線種）
+  if (anchorResult) {
+    const { lineY, targetX, targetY, lHand, depthFromLine, tapEvaluation } = anchorResult;
+    const halfWidth = Math.max(42, lHand * 0.4);
+    const state = tapEvaluation.state;
+
+    // (a) 指定指先端から判定ラインへの垂直ガイド線
+    canvasCtx.save();
+    canvasCtx.setLineDash([3, 3]);
+    canvasCtx.beginPath();
+    canvasCtx.moveTo(targetX, targetY);
+    canvasCtx.lineTo(targetX, lineY);
+    canvasCtx.lineWidth = 1.2;
+    canvasCtx.strokeStyle = state === 'ARMED' ? 'rgba(255, 255, 255, 0.85)' : 'rgba(255, 255, 255, 0.4)';
+    canvasCtx.stroke();
+    canvasCtx.restore();
+
+    // (b) 判定ライン本体（ステートに応じた視覚フィードバック）
+    if (state === 'ARMED') {
+      // ARMED状態: 二重線（ダブルライン）で進入中を強調
+      [-2.5, 2.5].forEach((dy) => {
+        canvasCtx.beginPath();
+        canvasCtx.moveTo(targetX - halfWidth, lineY + dy);
+        canvasCtx.lineTo(targetX + halfWidth, lineY + dy);
+        canvasCtx.lineWidth = 3;
+        canvasCtx.strokeStyle = '#000000';
+        canvasCtx.stroke();
+
+        canvasCtx.beginPath();
+        canvasCtx.moveTo(targetX - halfWidth, lineY + dy);
+        canvasCtx.lineTo(targetX + halfWidth, lineY + dy);
+        canvasCtx.lineWidth = 1.5;
+        canvasCtx.strokeStyle = '#ffffff';
+        canvasCtx.stroke();
+      });
+    } else if (state === 'HIT' || isRecentlyHit) {
+      // HIT状態: 太い高輝度白フラッシュライン
+      canvasCtx.beginPath();
+      canvasCtx.moveTo(targetX - halfWidth - 6, lineY);
+      canvasCtx.lineTo(targetX + halfWidth + 6, lineY);
+      canvasCtx.lineWidth = 6;
+      canvasCtx.strokeStyle = '#000000';
+      canvasCtx.stroke();
+
+      canvasCtx.beginPath();
+      canvasCtx.moveTo(targetX - halfWidth - 6, lineY);
+      canvasCtx.lineTo(targetX + halfWidth + 6, lineY);
+      canvasCtx.lineWidth = 3.5;
+      canvasCtx.strokeStyle = '#ffffff';
+      canvasCtx.stroke();
+    } else if (state === 'RESET') {
+      // RESET状態: 破線（復帰待機）
+      canvasCtx.save();
+      canvasCtx.setLineDash([4, 4]);
+      canvasCtx.beginPath();
+      canvasCtx.moveTo(targetX - halfWidth, lineY);
+      canvasCtx.lineTo(targetX + halfWidth, lineY);
+      canvasCtx.lineWidth = 3;
+      canvasCtx.strokeStyle = '#000000';
+      canvasCtx.stroke();
+
+      canvasCtx.beginPath();
+      canvasCtx.moveTo(targetX - halfWidth, lineY);
+      canvasCtx.lineTo(targetX + halfWidth, lineY);
+      canvasCtx.lineWidth = 1.5;
+      canvasCtx.strokeStyle = '#aaaaaa';
+      canvasCtx.stroke();
+      canvasCtx.restore();
+    } else {
+      // IDLE状態: 通常の細い水平線（白1.5px＋黒下地3.5px）
+      canvasCtx.beginPath();
+      canvasCtx.moveTo(targetX - halfWidth, lineY);
+      canvasCtx.lineTo(targetX + halfWidth, lineY);
+      canvasCtx.lineWidth = 3.5;
+      canvasCtx.strokeStyle = '#000000';
+      canvasCtx.stroke();
+
+      canvasCtx.beginPath();
+      canvasCtx.moveTo(targetX - halfWidth, lineY);
+      canvasCtx.lineTo(targetX + halfWidth, lineY);
+      canvasCtx.lineWidth = 1.5;
+      canvasCtx.strokeStyle = '#ffffff';
+      canvasCtx.stroke();
+    }
+
+    // (c) 両端のティックマーク（垂直目盛り: 4px）
+    const tickH = state === 'ARMED' ? 6 : 4;
+    [-halfWidth, halfWidth].forEach((offset) => {
+      canvasCtx.beginPath();
+      canvasCtx.moveTo(targetX + offset, lineY - tickH);
+      canvasCtx.lineTo(targetX + offset, lineY + tickH);
+      canvasCtx.lineWidth = 3.5;
+      canvasCtx.strokeStyle = '#000000';
+      canvasCtx.stroke();
+
+      canvasCtx.beginPath();
+      canvasCtx.moveTo(targetX + offset, lineY - tickH);
+      canvasCtx.lineTo(targetX + offset, lineY + tickH);
+      canvasCtx.lineWidth = 1.5;
+      canvasCtx.strokeStyle = '#ffffff';
+      canvasCtx.stroke();
+    });
+
+    // (d) HTML上のステート＆数値更新
+    if (debugStateEl) {
+      debugStateEl.textContent = state;
+      debugStateEl.className = `state-badge state-${state.toLowerCase()}`;
+    }
+    if (debugScaleEl) debugScaleEl.textContent = `L_hand: ${Math.round(lHand)}px`;
+    if (debugLineEl) debugLineEl.textContent = `Line_Y: ${Math.round(lineY)}px`;
+    if (debugDepthEl) {
+      const depthRounded = Math.round(depthFromLine);
+      debugDepthEl.textContent = `ΔY: ${depthRounded > 0 ? '+' : ''}${depthRounded}px`;
+      if (depthRounded >= 0) {
+        debugDepthEl.classList.add('crossed');
+      } else {
+        debugDepthEl.classList.remove('crossed');
+      }
+    }
+  } else {
+    if (debugStateEl) {
+      debugStateEl.textContent = 'IDLE';
+      debugStateEl.className = 'state-badge state-idle';
+    }
+    if (debugScaleEl) debugScaleEl.textContent = `L_hand: 検出待機中`;
+    if (debugLineEl) debugLineEl.textContent = `Line_Y: --`;
+    if (debugDepthEl) {
+      debugDepthEl.textContent = `ΔY: --`;
+      debugDepthEl.classList.remove('crossed');
+    }
+  }
 }
 
 // イベントリスナー
@@ -414,3 +584,6 @@ window.addEventListener('pointerdown', () => {
 
 // アプリ開始
 initializeApp();
+
+
+

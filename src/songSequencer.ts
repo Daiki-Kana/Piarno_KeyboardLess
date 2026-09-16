@@ -4,6 +4,21 @@
  * 1音ずつ確実に演奏を待機・進行させるシーケンサーモジュール。
  */
 
+import { FingertipLandmarkIndex } from './anchorLineTracker';
+
+export type FingerName =
+  | 'THUMB'
+  | 'INDEX'
+  | 'MIDDLE'
+  | 'RING'
+  | 'PINKY'
+  | 'Thumb'
+  | 'Index'
+  | 'Middle'
+  | 'Ring'
+  | 'Pinky';
+export type FingerLabel = '親指' | '人差し指' | '中指' | '薬指' | '小指';
+
 export interface NoteInfo {
   pitch: string;      // 例: "C4", "C5"
   solfege: string;    // 例: "ド", "ソ"
@@ -11,6 +26,9 @@ export interface NoteInfo {
   chord?: readonly number[]; // 和音構成周波数の配列 (Hz) - 左手コード伴奏用
   durationBeats?: number; // 拍数（表示用）
   hand?: 'Left' | 'Right'; // パート種別
+  targetFingerTipIndex?: FingertipLandmarkIndex;
+  targetFingerName?: FingerName;
+  targetFingerLabel?: FingerLabel;
 }
 
 export interface SongData {
@@ -192,11 +210,76 @@ export const TWINKLE_STAR_TWO_HANDS: SongData = {
   ],
 };
 
+/**
+ * テスト楽曲: メリーさんのひつじ 冒頭フレーズ（右手打鍵テスト用・全7音）
+ * - 1音目: E4（ミ） / 中指
+ * - 2音目: D4（レ） / 人差し指
+ * - 3音目: C4（ド） / 人差し指
+ * - 4音目: D4（レ） / 人差し指
+ * - 5音目: E4（ミ） / 中指
+ * - 6音目: E4（ミ） / 中指
+ * - 7音目: E4（ミ） / 中指（※最後まで弾いたら最初へループ）
+ */
+export const MARY_LAMB: SongData = {
+  id: 'mary_lamb',
+  title: 'メリーさんのひつじ',
+  notes: [
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right', targetFingerTipIndex: 12, targetFingerName: 'Middle', targetFingerLabel: '中指' },
+    { pitch: 'D4', solfege: 'レ', frequency: NOTE_FREQS.D4, hand: 'Right', targetFingerTipIndex: 8,  targetFingerName: 'Index',  targetFingerLabel: '人差し指' },
+    { pitch: 'C4', solfege: 'ド', frequency: NOTE_FREQS.C4, hand: 'Right', targetFingerTipIndex: 8,  targetFingerName: 'Index',  targetFingerLabel: '人差し指' },
+    { pitch: 'D4', solfege: 'レ', frequency: NOTE_FREQS.D4, hand: 'Right', targetFingerTipIndex: 8,  targetFingerName: 'Index',  targetFingerLabel: '人差し指' },
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right', targetFingerTipIndex: 12, targetFingerName: 'Middle', targetFingerLabel: '中指' },
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right', targetFingerTipIndex: 12, targetFingerName: 'Middle', targetFingerLabel: '中指' },
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right', targetFingerTipIndex: 12, targetFingerName: 'Middle', targetFingerLabel: '中指' },
+  ],
+};
+
+/**
+ * テスト楽曲: 喜びの歌（歓喜の歌）冒頭16音（15音）シーケンス（右手5指Cポジション）
+ * 1.  E4 (ミ) / Middle (12)
+ * 2.  E4 (ミ) / Middle (12)
+ * 3.  F4 (ファ) / Ring (16)
+ * 4.  G4 (ソ) / Pinky (20)
+ * 5.  G4 (ソ) / Pinky (20)
+ * 6.  F4 (ファ) / Ring (16)
+ * 7.  E4 (ミ) / Middle (12)
+ * 8.  D4 (レ) / Index (8)
+ * 9.  C4 (ド) / Thumb (4)
+ * 10. C4 (ド) / Thumb (4)
+ * 11. D4 (レ) / Index (8)
+ * 12. E4 (ミ) / Middle (12)
+ * 13. E4 (ミ) / Middle (12)
+ * 14. D4 (レ) / Index (8)
+ * 15. D4 (レ) / Index (8)
+ * (完了後は先頭へ自動ループ)
+ */
+export const ODE_TO_JOY: SongData = {
+  id: 'ode_to_joy',
+  title: '喜びの歌（歓喜の歌）',
+  notes: [
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right', targetFingerTipIndex: 12, targetFingerName: 'MIDDLE', targetFingerLabel: '中指' },
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right', targetFingerTipIndex: 12, targetFingerName: 'MIDDLE', targetFingerLabel: '中指' },
+    { pitch: 'F4', solfege: 'ファ', frequency: NOTE_FREQS.F4, hand: 'Right', targetFingerTipIndex: 16, targetFingerName: 'RING',   targetFingerLabel: '薬指' },
+    { pitch: 'G4', solfege: 'ソ', frequency: NOTE_FREQS.G4, hand: 'Right', targetFingerTipIndex: 20, targetFingerName: 'PINKY',  targetFingerLabel: '小指' },
+    { pitch: 'G4', solfege: 'ソ', frequency: NOTE_FREQS.G4, hand: 'Right', targetFingerTipIndex: 20, targetFingerName: 'PINKY',  targetFingerLabel: '小指' },
+    { pitch: 'F4', solfege: 'ファ', frequency: NOTE_FREQS.F4, hand: 'Right', targetFingerTipIndex: 16, targetFingerName: 'RING',   targetFingerLabel: '薬指' },
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right', targetFingerTipIndex: 12, targetFingerName: 'MIDDLE', targetFingerLabel: '中指' },
+    { pitch: 'D4', solfege: 'レ', frequency: NOTE_FREQS.D4, hand: 'Right', targetFingerTipIndex: 8,  targetFingerName: 'INDEX',  targetFingerLabel: '人差し指' },
+    { pitch: 'C4', solfege: 'ド', frequency: NOTE_FREQS.C4, hand: 'Right', targetFingerTipIndex: 4,  targetFingerName: 'THUMB',  targetFingerLabel: '親指' },
+    { pitch: 'C4', solfege: 'ド', frequency: NOTE_FREQS.C4, hand: 'Right', targetFingerTipIndex: 4,  targetFingerName: 'THUMB',  targetFingerLabel: '親指' },
+    { pitch: 'D4', solfege: 'レ', frequency: NOTE_FREQS.D4, hand: 'Right', targetFingerTipIndex: 8,  targetFingerName: 'INDEX',  targetFingerLabel: '人差し指' },
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right', targetFingerTipIndex: 12, targetFingerName: 'MIDDLE', targetFingerLabel: '中指' },
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right', targetFingerTipIndex: 12, targetFingerName: 'MIDDLE', targetFingerLabel: '中指' },
+    { pitch: 'D4', solfege: 'レ', frequency: NOTE_FREQS.D4, hand: 'Right', targetFingerTipIndex: 8,  targetFingerName: 'INDEX',  targetFingerLabel: '人差し指' },
+    { pitch: 'D4', solfege: 'レ', frequency: NOTE_FREQS.D4, hand: 'Right', targetFingerTipIndex: 8,  targetFingerName: 'INDEX',  targetFingerLabel: '人差し指' },
+  ],
+};
+
 export class SongSequencer {
   private currentSong: SongData;
   private currentIndex: number = 0;
 
-  constructor(initialSong: SongData = TWINKLE_STAR_TWO_HANDS) {
+  constructor(initialSong: SongData = ODE_TO_JOY) {
     this.currentSong = initialSong;
     this.currentIndex = 0;
   }

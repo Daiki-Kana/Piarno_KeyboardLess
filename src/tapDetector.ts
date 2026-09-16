@@ -1,14 +1,16 @@
 /**
- * 指先の垂直方向減速ピークによる机タップ（打鍵）検知エンジン
+ * 机面（接地）ハイブリッド打鍵検知エンジン
+ * 
+ * 従来の「加速度（急減速）スパイク依存」を完全撤廃し、以下の2軸で判定：
+ * 1. 手首Y座標（机面レベル判定）による空中キャンセルガード
+ * 2. 指先Y座標の最下点変曲点（ピーク）検知（低速押し込み・通常タップ両対応）
  */
 
 export interface TapDetectorConfig {
-  /** 能動的振り下ろしとみなす最小垂直速度 (正規化座標/s, デフォルト: 0.45) */
+  /** 手首の空中キャンセル閾値 (画面上 0.0 ~ 下 1.0, 手首がこれより上にあると空中として判定ブロック, デフォルト: 0.38) */
+  minWristY?: number;
+  /** 打鍵検知に必要な最小下向き移動速度 (正規化座標/s, デフォルト: 0.08) */
   minDownVelocity?: number;
-  /** 机衝突時の急減速加速度ピーク閾値 (/s², 負値, デフォルト: -14.0) */
-  minDecelPeak?: number;
-  /** 振り下ろし開始から着地インパクトまでの許容時間窓 (ms, デフォルト: 140) */
-  maxDownToImpactMs?: number;
   /** 打鍵後の不応期 (ms, チャタリング防止, デフォルト: 150) */
   cooldownMs?: number;
 }
@@ -30,30 +32,39 @@ interface FingerState {
   lastTime: number;
   lastY: number;
   lastVy: number;
-  /** 直近の能動的振り下ろし発生時刻 */
-  lastActiveDownTime: number;
-  /** その振り下ろし中の最大下向き速度 */
-  maxActiveDownVy: number;
+  /** 直近のY座標履歴 (最下点変曲点検知用, 最大4フレーム) */
+  yHistory: number[];
+  /** 下向き動作開始時の最大下向き速度 */
+  maxDownVy: number;
+  /** 下向き動作が開始された時刻 */
+  downStartTime: number;
   /** 最終打鍵検知時刻 */
   lastTapTime: number;
 }
 
 export class TapDetector {
+  private minWristY: number;
   private minDownVelocity: number;
-  private minDecelPeak: number;
-  private maxDownToImpactMs: number;
   private cooldownMs: number;
   private fingerStates = new Map<string, FingerState>();
 
   constructor(config: TapDetectorConfig = {}) {
-    this.minDownVelocity = config.minDownVelocity ?? 0.30;
-    this.minDecelPeak = config.minDecelPeak ?? -7.0;
-    this.maxDownToImpactMs = config.maxDownToImpactMs ?? 220;
-    this.cooldownMs = config.cooldownMs ?? 130;
+    this.minWristY = config.minWristY ?? 0.38;
+    this.minDownVelocity = config.minDownVelocity ?? 0.08;
+    this.cooldownMs = config.cooldownMs ?? 150;
   }
 
   /**
-   * 単一の指先座標を評価し、能動的振り下ろし＋机衝突の急減速が成立した場合に TapEvent を返す
+   * 単一の指先座標を評価し、机面への接触（最下点変曲点）が成立した場合に TapEvent を返す
+   * 
+   * @param handedness 左右
+   * @param tipIndex 指先インデックス (4, 8, 12, 16, 20)
+   * @param name 指の名前
+   * @param x 指先X座標
+   * @param y 指先Y座標 (画面上 0.0 ~ 下 1.0)
+   * @param z 指先Z座標
+   * @param timestamp フレームタイムスタンプ (ms)
+   * @param wristY 手首のY座標 (空中キャンセルガード用)
    */
   processFingertip(
     handedness: 'Left' | 'Right',
@@ -62,24 +73,20 @@ export class TapDetector {
     x: number,
     y: number,
     z: number,
-    timestamp: number
+    timestamp: number,
+    wristY?: number
   ): TapEvent | null {
     const key = `${handedness}_${tipIndex}`;
     let state = this.fingerStates.get(key);
-
-    // 親指(4)、小指(20)、薬指(16)は独立した垂直可動域が小さく力が出にくいため、感度を専用ブースト
-    const isWeakFinger = tipIndex === 4 || tipIndex === 20 || tipIndex === 16;
-    const effectiveMinDownVelocity = isWeakFinger ? this.minDownVelocity * 0.40 : this.minDownVelocity;
-    const effectiveMinDecelPeak = isWeakFinger ? this.minDecelPeak * 0.40 : this.minDecelPeak;
-    const effectiveAyThreshold = isWeakFinger ? -3.0 : -6.0;
 
     if (!state) {
       state = {
         lastTime: timestamp,
         lastY: y,
         lastVy: 0,
-        lastActiveDownTime: -9999,
-        maxActiveDownVy: 0,
+        yHistory: [y],
+        maxDownVy: 0,
+        downStartTime: -9999,
         lastTapTime: -9999,
       };
       this.fingerStates.set(key, state);
@@ -93,44 +100,66 @@ export class TapDetector {
       state.lastTime = timestamp;
       state.lastY = y;
       state.lastVy = 0;
-      state.lastActiveDownTime = -9999;
-      state.maxActiveDownVy = 0;
+      state.yHistory = [y];
+      state.maxDownVy = 0;
+      state.downStartTime = -9999;
       return null;
     }
 
     // 垂直方向速度 (下向き移動を正とする)
     const vy = (y - state.lastY) / dt;
-    // 垂直方向加速度 (下向き加速が正、急減速・衝突が負の急峻ピーク)
-    const ay = (vy - state.lastVy) / dt;
+
+    // Y座標履歴を更新（最大4フレーム保持）
+    state.yHistory.push(y);
+    if (state.yHistory.length > 4) {
+      state.yHistory.shift();
+    }
 
     const timeSinceLastTap = timestamp - state.lastTapTime;
     const isCoolingDown = timeSinceLastTap < this.cooldownMs;
 
-    // 段階1: 明確な能動的振り下ろし（アクティブダウン）の検知と記憶
-    if (vy >= effectiveMinDownVelocity) {
-      state.lastActiveDownTime = timestamp;
-      state.maxActiveDownVy = Math.max(state.maxActiveDownVy, vy);
+    // 下向き移動中かどうかの追跡
+    if (vy >= this.minDownVelocity) {
+      if (timestamp - state.downStartTime > 250) {
+        state.downStartTime = timestamp;
+        state.maxDownVy = vy;
+      } else {
+        state.maxDownVy = Math.max(state.maxDownVy, vy);
+      }
     }
 
     let tapEvent: TapEvent | null = null;
 
     if (!isCoolingDown) {
-      // 直近 (maxDownToImpactMs 以内) に十分なスピードの振り下ろしが発生しているか
-      const hasRecentActiveDown =
-        timestamp - state.lastActiveDownTime <= this.maxDownToImpactMs &&
-        state.maxActiveDownVy >= effectiveMinDownVelocity;
+      // 1. 空中キャンセルガード（机面レベル判定）
+      // 手首Y座標が画面上端近く（空中）にある場合は、どれだけ指を動かしても打鍵をブロック
+      const currentWristY = wristY !== undefined ? wristY : y;
+      const isNearDesk = currentWristY >= this.minWristY;
 
-      // 段階2: 机衝突による物理的急減速（負の急峻な加速度ピーク または 強い制動）
-      const hasDecelPeak = ay <= effectiveMinDecelPeak;
-      const hasSharpVelocityDrop =
-        state.lastVy >= effectiveMinDownVelocity &&
-        vy <= state.lastVy * 0.40 &&
-        ay <= effectiveAyThreshold;
+      // 2. 最下点変曲点（ピーク）検知:
+      // 指が机に向かって下向きに進行し、机面に接触して停止または反発した瞬間
+      let isImpactPeak = false;
+      if (state.yHistory.length >= 3) {
+        const y0 = state.yHistory[state.yHistory.length - 3];
+        const y1 = state.yHistory[state.yHistory.length - 2];
+        const y2 = state.yHistory[state.yHistory.length - 1];
 
-      if (hasRecentActiveDown && (hasDecelPeak || hasSharpVelocityDrop)) {
-        // 振り下ろしピーク速度を元にベロシティ (0.2 ~ 1.0) を算出
-        const impactSpeed = Math.max(state.lastVy, state.maxActiveDownVy);
-        const velocity = Math.min(1.0, Math.max(0.2, impactSpeed / (isWeakFinger ? 1.0 : 1.6)));
+        // y1 が直前フレームで下向きに動いており、y2 で進行が止まった（または反発した）
+        const wasMovingDown = y1 - y0 >= 0.0015;
+        const hasStoppedOrRebounded = y2 <= y1 + 0.0025;
+
+        isImpactPeak = wasMovingDown && hasStoppedOrRebounded;
+      }
+
+      // 3. 直近200ms以内に有意な下向き動作が存在していたか
+      const hasRecentDownMotion =
+        timestamp - state.downStartTime <= 220 &&
+        state.maxDownVy >= this.minDownVelocity;
+
+      if (isNearDesk && isImpactPeak && hasRecentDownMotion) {
+        // 自然なベロシティ算出（低速押し込みでも聞き取りやすい音量を保証）
+        const impactSpeed = Math.max(state.maxDownVy, state.lastVy, 0.08);
+        const velocity = Math.min(1.0, Math.max(0.35, 0.35 + (impactSpeed - 0.08) * 1.5));
 
         tapEvent = {
           handedness,
@@ -145,15 +174,16 @@ export class TapDetector {
 
         // 打鍵成立: 状態更新とクールダウン突入
         state.lastTapTime = timestamp;
-        state.lastActiveDownTime = -9999;
-        state.maxActiveDownVy = 0;
+        state.downStartTime = -9999;
+        state.maxDownVy = 0;
+        state.yHistory = [y];
       }
     }
 
-    // 指が上向きに引き上げられた場合は振り下ろし状態をクリア
-    if (vy < -0.15) {
-      state.lastActiveDownTime = -9999;
-      state.maxActiveDownVy = 0;
+    // 指が上向きに明確に引き上げられた場合は状態をリセット
+    if (vy < -0.10) {
+      state.downStartTime = -9999;
+      state.maxDownVy = 0;
     }
 
     // 状態更新
@@ -162,6 +192,17 @@ export class TapDetector {
     state.lastVy = vy;
 
     return tapEvent;
+  }
+
+  /**
+   * 空中ガード用の手首高さ閾値を動的調整
+   */
+  setMinWristY(val: number): void {
+    this.minWristY = Math.max(0.0, Math.min(1.0, val));
+  }
+
+  getMinWristY(): number {
+    return this.minWristY;
   }
 
   /**
