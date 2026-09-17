@@ -192,11 +192,57 @@ export const TWINKLE_STAR_TWO_HANDS: SongData = {
   ],
 };
 
+/**
+ * 演奏テスト楽曲: メリーさんの羊 (Mary Had a Little Lamb - 右手単独テスト版)
+ * 右手の5本指（親指:C4 〜 小指:G4）に1音ずつ対応した全26音のシーケンス
+ */
+export const MARY_HAD_A_LITTLE_LAMB_RIGHT_HAND: SongData = {
+  id: 'mary_had_a_little_lamb',
+  title: 'メリーさんの羊 (右手単独テスト)',
+  notes: [
+    // 1行目: ミ レ ド レ ミ ミ ミー (7音)
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right' },
+    { pitch: 'D4', solfege: 'レ', frequency: NOTE_FREQS.D4, hand: 'Right' },
+    { pitch: 'C4', solfege: 'ド', frequency: NOTE_FREQS.C4, hand: 'Right' },
+    { pitch: 'D4', solfege: 'レ', frequency: NOTE_FREQS.D4, hand: 'Right' },
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right' },
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right' },
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, durationBeats: 2, hand: 'Right' },
+
+    // 2行目: レ レ レー (3音)
+    { pitch: 'D4', solfege: 'レ', frequency: NOTE_FREQS.D4, hand: 'Right' },
+    { pitch: 'D4', solfege: 'レ', frequency: NOTE_FREQS.D4, hand: 'Right' },
+    { pitch: 'D4', solfege: 'レ', frequency: NOTE_FREQS.D4, durationBeats: 2, hand: 'Right' },
+
+    // 3行目: ミ ソ ソー (3音)
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right' },
+    { pitch: 'G4', solfege: 'ソ', frequency: NOTE_FREQS.G4, hand: 'Right' },
+    { pitch: 'G4', solfege: 'ソ', frequency: NOTE_FREQS.G4, durationBeats: 2, hand: 'Right' },
+
+    // 4行目: ミ レ ド レ ミ ミ ミ ミ (8音)
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right' },
+    { pitch: 'D4', solfege: 'レ', frequency: NOTE_FREQS.D4, hand: 'Right' },
+    { pitch: 'C4', solfege: 'ド', frequency: NOTE_FREQS.C4, hand: 'Right' },
+    { pitch: 'D4', solfege: 'レ', frequency: NOTE_FREQS.D4, hand: 'Right' },
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right' },
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right' },
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right' },
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right' },
+
+    // 5行目: レ レ ミ レ ドー (5音)
+    { pitch: 'D4', solfege: 'レ', frequency: NOTE_FREQS.D4, hand: 'Right' },
+    { pitch: 'D4', solfege: 'レ', frequency: NOTE_FREQS.D4, hand: 'Right' },
+    { pitch: 'E4', solfege: 'ミ', frequency: NOTE_FREQS.E4, hand: 'Right' },
+    { pitch: 'D4', solfege: 'レ', frequency: NOTE_FREQS.D4, hand: 'Right' },
+    { pitch: 'C4', solfege: 'ド', frequency: NOTE_FREQS.C4, durationBeats: 2, hand: 'Right' },
+  ],
+};
+
 export class SongSequencer {
   private currentSong: SongData;
   private currentIndex: number = 0;
 
-  constructor(initialSong: SongData = TWINKLE_STAR_TWO_HANDS) {
+  constructor(initialSong: SongData = MARY_HAD_A_LITTLE_LAMB_RIGHT_HAND) {
     this.currentSong = initialSong;
     this.currentIndex = 0;
   }

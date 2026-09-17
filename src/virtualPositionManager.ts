@@ -36,6 +36,15 @@ export const RIGHT_FINGERS: readonly TargetFinger[] = [
   { hand: 'right', handedness: 'Right', tipIndex: 20, name: '右手 小指', fingerNumber: 5, finger: 4, orderIndex: 9 },
 ] as const;
 
+/** 右手基本5音(C4〜G4)の固定指マッピング (親指:C4, 人差指:D4, 中指:E4, 薬指:F4, 小指:G4) */
+export const RIGHT_HAND_FIXED_FINGERS: Record<string, TargetFinger> = {
+  C4: RIGHT_FINGERS[0], // 親指 (4)
+  D4: RIGHT_FINGERS[1], // 人差指 (8)
+  E4: RIGHT_FINGERS[2], // 中指 (12)
+  F4: RIGHT_FINGERS[3], // 薬指 (16)
+  G4: RIGHT_FINGERS[4], // 小指 (20)
+};
+
 /** 白鍵（ダイアトニック）音階の基準オフセット (C4 = 0) */
 const DIATONIC_BASE_MAP: Record<string, number> = {
   C: 0,
@@ -149,6 +158,16 @@ export class VirtualPositionManager {
     let chosenFinger: TargetFinger;
 
     if (targetHand === 'Right') {
+      // 右手固定ポジション（C4〜G4）が指定されている場合は、常に1対1の確実な指を割り当てる
+      if (RIGHT_HAND_FIXED_FINGERS[note.pitch]) {
+        chosenFinger = RIGHT_HAND_FIXED_FINGERS[note.pitch];
+        this.status.activeHand = 'Right';
+        this.status.slideDescription = `右手固定ポジション -> ${chosenFinger.name}`;
+        this.lastPitch = note.pitch;
+        this.lastFinger = chosenFinger;
+        return chosenFinger;
+      }
+
       // ==========================================
       // 【右手】の動的指割り当て & ポジションスライド
       // カバー範囲: [rightBase, rightBase + 4]

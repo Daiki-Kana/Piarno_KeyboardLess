@@ -30,6 +30,29 @@ export class HandTracker {
   private lastTimestamp = -1;
   public activeDelegate: 'GPU' | 'CPU' = 'GPU';
 
+  // 手首アンカーおよび追跡フェーズ管理
+  private leftWristAnchor: { x: number; y: number } | null = null;
+  private rightWristAnchor: { x: number; y: number } | null = null;
+  private isCalibrated = false;
+  private isPlaying = false;
+
+  /**
+   * 演奏中フェーズの切り替え
+   */
+  public setPlaying(playing: boolean): void {
+    this.isPlaying = playing;
+  }
+
+  /**
+   * キャリブレーションおよび手首アンカーのリセット
+   */
+  public resetCalibration(): void {
+    this.leftWristAnchor = null;
+    this.rightWristAnchor = null;
+    this.isCalibrated = false;
+    this.isPlaying = false;
+  }
+
   /**
    * MediaPipe Tasks-Vision の FilesetResolver と HandLandmarker を初期化
    * iOS Safari 等で WebGL/OffscreenCanvas が制限される場合、CPU へ自動フォールバック
@@ -78,7 +101,7 @@ export class HandTracker {
   }
 
   /**
-   * ビデオフレームから両手の指先座標を検出
+   * ビデオフレームから両手の指先座標を検出し、手首座標によるID固定スロット追跡を行う
    */
   detect(videoElement: HTMLVideoElement, timestamp: number): HandData[] {
     if (!this.handLandmarker || !this.isInitialized) {
@@ -102,12 +125,12 @@ export class HandTracker {
       return hands;
     }
 
-    // 各手の中心X座標を算出し、左右空間位置を判定
-    // (前面カメラの生映像では、ユーザーの左手は x > 0.5、右手は x < 0.5 に映る)
     interface RawHandCandidate {
       landmarks: { x: number; y: number; z: number }[];
       confidenceScore: number;
       centerX: number;
+      wrist: { x: number; y: number };
+      screenX: number; // 画面表示基準のX座標 (CSS mirror反転 scaleX(-1) を考慮)
     }
 
     const candidates: RawHandCandidate[] = results.landmarks.map((landmarks, i) => {
@@ -115,59 +138,109 @@ export class HandTracker {
       if (results.handednesses && results.handednesses[i] && results.handednesses[i][0]) {
         confidenceScore = results.handednesses[i][0].score ?? 0;
       }
-      // 手首(0)と各指先の中間値として全体重心Xを算出
+      const wristPoint = landmarks[0]; // 手首ランドマーク (landmark 0)
       const centerX = landmarks.reduce((acc, pt) => acc + pt.x, 0) / landmarks.length;
-      return { landmarks, confidenceScore, centerX };
+      return {
+        landmarks,
+        confidenceScore,
+        centerX,
+        wrist: { x: wristPoint.x, y: wristPoint.y },
+        screenX: 1.0 - wristPoint.x, // 生座標反転 -> 画面左側が小、画面右側が大
+      };
     });
 
-    if (candidates.length === 2) {
-      // 2本の手が検出されている場合: X座標が大きい方(鏡像で画面左側)が確実に左手、小さい方が右手
-      candidates.sort((a, b) => b.centerX - a.centerX); // 降順: [0]が左手, [1]が右手
-
-      const assignHandedness = (cand: RawHandCandidate, handedness: 'Left' | 'Right'): HandData => {
-        const fingertips: FingertipCoord[] = FINGERTIP_INDICES.map((tip) => {
-          const point = cand.landmarks[tip.index];
-          return {
-            tipIndex: tip.index,
-            name: tip.name,
-            x: point.x,
-            y: point.y,
-            z: point.z,
-          };
-        });
+    const createHandData = (cand: RawHandCandidate, handedness: 'Left' | 'Right'): HandData => {
+      const fingertips: FingertipCoord[] = FINGERTIP_INDICES.map((tip) => {
+        const point = cand.landmarks[tip.index];
         return {
-          handedness,
-          score: cand.confidenceScore,
-          fingertips,
-          allLandmarks: cand.landmarks,
-          centerX: cand.centerX,
+          tipIndex: tip.index,
+          name: tip.name,
+          x: point.x,
+          y: point.y,
+          z: point.z,
         };
-      };
-
-      hands.push(assignHandedness(candidates[0], 'Left'));
-      hands.push(assignHandedness(candidates[1], 'Right'));
-    } else {
-      // 1本の手のみ検出されている場合: 画面中央(0.46)を境に判定
-      candidates.forEach((cand) => {
-        const handedness: 'Left' | 'Right' = cand.centerX > 0.46 ? 'Left' : 'Right';
-        const fingertips: FingertipCoord[] = FINGERTIP_INDICES.map((tip) => {
-          const point = cand.landmarks[tip.index];
-          return {
-            tipIndex: tip.index,
-            name: tip.name,
-            x: point.x,
-            y: point.y,
-            z: point.z,
-          };
-        });
-        hands.push({
-          handedness,
-          score: cand.confidenceScore,
-          fingertips,
-          allLandmarks: cand.landmarks,
-          centerX: cand.centerX,
-        });
       });
+      return {
+        handedness,
+        score: cand.confidenceScore,
+        fingertips,
+        allLandmarks: cand.landmarks,
+        centerX: cand.centerX,
+      };
+    };
+
+    const dist = (p1: { x: number; y: number }, p2: { x: number; y: number }) => {
+      const dx = p1.x - p2.x;
+      const dy = p1.y - p2.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    };
+
+    // =========================================================================
+    // 1. 初期構え・キャリブレーションフェーズ（演奏開始前、または未キャリブレーション時）
+    // =========================================================================
+    if (!this.isPlaying || !this.isCalibrated || !this.leftWristAnchor || !this.rightWristAnchor) {
+      if (candidates.length === 2) {
+        // 2手検出時: 画面表示Xが小さい方を左手スロット、大きい方を右手スロットとして確定
+        if (candidates[0].screenX <= candidates[1].screenX) {
+          this.leftWristAnchor = { ...candidates[0].wrist };
+          this.rightWristAnchor = { ...candidates[1].wrist };
+          hands.push(createHandData(candidates[0], 'Left'));
+          hands.push(createHandData(candidates[1], 'Right'));
+        } else {
+          this.leftWristAnchor = { ...candidates[1].wrist };
+          this.rightWristAnchor = { ...candidates[0].wrist };
+          hands.push(createHandData(candidates[1], 'Left'));
+          hands.push(createHandData(candidates[0], 'Right'));
+        }
+        this.isCalibrated = true;
+      } else {
+        // 1手のみ検出時: 画面中央 (screenX = 0.5) を基準に暫定割り当て
+        const cand = candidates[0];
+        const handedness: 'Left' | 'Right' = cand.screenX < 0.5 ? 'Left' : 'Right';
+        if (handedness === 'Left') {
+          this.leftWristAnchor = { ...cand.wrist };
+        } else {
+          this.rightWristAnchor = { ...cand.wrist };
+        }
+        hands.push(createHandData(cand, handedness));
+      }
+      return hands;
+    }
+
+    // =========================================================================
+    // 2. 演奏中フェーズ: 手首最近傍マッチング（MediaPipeの順序・ラベル無視のID固定）
+    // =========================================================================
+    if (candidates.length === 2) {
+      // 候補0, 候補1 を leftWristAnchor, rightWristAnchor と総当たり比較
+      const costA = dist(candidates[0].wrist, this.leftWristAnchor) + dist(candidates[1].wrist, this.rightWristAnchor);
+      const costB = dist(candidates[0].wrist, this.rightWristAnchor) + dist(candidates[1].wrist, this.leftWristAnchor);
+
+      if (costA <= costB) {
+        // 候補0 -> Left, 候補1 -> Right
+        this.leftWristAnchor = { ...candidates[0].wrist };
+        this.rightWristAnchor = { ...candidates[1].wrist };
+        hands.push(createHandData(candidates[0], 'Left'));
+        hands.push(createHandData(candidates[1], 'Right'));
+      } else {
+        // 候補0 -> Right, 候補1 -> Left
+        this.leftWristAnchor = { ...candidates[1].wrist };
+        this.rightWristAnchor = { ...candidates[0].wrist };
+        hands.push(createHandData(candidates[1], 'Left'));
+        hands.push(createHandData(candidates[0], 'Right'));
+      }
+    } else {
+      // 1手のみ検出時: 前フレームで保持している手首位置に近い方のスロットへ割り当て
+      const cand = candidates[0];
+      const distToLeft = dist(cand.wrist, this.leftWristAnchor);
+      const distToRight = dist(cand.wrist, this.rightWristAnchor);
+
+      if (distToLeft <= distToRight) {
+        this.leftWristAnchor = { ...cand.wrist };
+        hands.push(createHandData(cand, 'Left'));
+      } else {
+        this.rightWristAnchor = { ...cand.wrist };
+        hands.push(createHandData(cand, 'Right'));
+      }
     }
 
     return hands;

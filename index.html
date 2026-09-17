@@ -24,6 +24,58 @@
         <button id="countdown-btn" class="minimal-btn" style="display: none;">スタート</button>
         <div id="countdown-display" class="countdown-text"></div>
       </div>
+
+      <!-- 演奏シーケンス進行パネル (画面左上・白黒ミニマル) -->
+      <div id="sequence-panel" class="sequence-panel">
+        <div class="sequence-header">
+          <span class="sequence-title">MARY HAD A LITTLE LAMB</span>
+          <span id="seq-progress" class="seq-progress">Note 1 / 26</span>
+        </div>
+        <div class="sequence-body">
+          <div class="seq-row">
+            <span class="seq-label">Target:</span>
+            <span id="seq-target-finger" class="seq-target-val">Right Middle (E4)</span>
+          </div>
+          <div class="seq-row">
+            <span class="seq-label">Next:</span>
+            <span id="seq-next-finger" class="seq-next-val">Right Index (D4)</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 相対速度比較デバッグUI (白黒ミニマル) -->
+      <div id="debug-gate-panel" class="debug-panel">
+        <div class="debug-header">
+          <span class="debug-title">TAP GATE DEBUG</span>
+          <span id="debug-k-label" class="debug-k-val">K: 1.4</span>
+        </div>
+        <div class="debug-control">
+          <label for="k-slider" class="debug-label">係数 K</label>
+          <input type="range" id="k-slider" min="1.0" max="2.5" step="0.1" value="1.4" class="debug-slider" />
+        </div>
+        <div class="debug-metrics">
+          <div class="debug-row">
+            <span class="debug-label">指定指:</span>
+            <span id="debug-target-finger" class="debug-value">-</span>
+          </div>
+          <div class="debug-row">
+            <span class="debug-label">指定指速度 (Vy):</span>
+            <span id="debug-target-vy" class="debug-value">0.00</span>
+          </div>
+          <div class="debug-row">
+            <span class="debug-label">他指最大速度 (Vy):</span>
+            <span id="debug-max-other-vy" class="debug-value">0.00</span>
+          </div>
+          <div class="debug-row">
+            <span class="debug-label">相対比率 (Vy/Other):</span>
+            <span id="debug-ratio" class="debug-value">0.00</span>
+          </div>
+          <div class="debug-row debug-result-row">
+            <span class="debug-label">直前判定:</span>
+            <span id="debug-last-result" class="debug-value debug-result-waiting">WAITING</span>
+          </div>
+        </div>
+      </div>
     </div>
 
     <script type="module" src="./src/main.ts"></script>
