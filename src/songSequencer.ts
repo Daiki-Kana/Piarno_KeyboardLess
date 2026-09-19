@@ -263,6 +263,14 @@ export class SongSequencer {
   }
 
   /**
+   * 指定インデックスの音符を取得
+   */
+  public getNoteAt(index: number): NoteInfo | null {
+    if (index < 0 || index >= this.currentSong.notes.length) return null;
+    return this.currentSong.notes[index];
+  }
+
+  /**
    * 現在のインデックス位置 (0-based)
    */
   public getCurrentIndex(): number {

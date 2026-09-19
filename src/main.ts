@@ -4,6 +4,7 @@ import { TapDetector, TapEvent } from './tapDetector';
 import { PianoSynth } from './pianoSynth';
 import { SongSequencer } from './songSequencer';
 import { VirtualPositionManager, TargetFinger, RIGHT_HAND_FIXED_FINGERS } from './virtualPositionManager';
+import { HologramEffectManager } from './hologramEffect';
 
 // DOM 要素
 const videoElement = document.getElementById('webcam') as HTMLVideoElement;
@@ -33,7 +34,36 @@ const tapDetector = new TapDetector();
 const pianoSynth = new PianoSynth();
 const sequencer = new SongSequencer();
 const positionManager = new VirtualPositionManager('C4', 'C4');
+const hologramEffect = new HologramEffectManager();
 const filterMap = new Map<string, OneEuroFilter3D>();
+/**
+ * 各指の骨格キネマティクス設定
+ * 机面接地オクルージョン時に、空中の健全な手前関節（PIP → DIP）から指先（TIP）位置を幾何学的に復元
+ */
+interface FingerKinematics {
+  tipIndex: number;
+  dipIndex: number; // 親指の場合は IP(3)
+  pipIndex: number; // 親指の場合は MCP(2)
+  boneRatio: number; // DIP-TIP と PIP-DIP の骨長比率
+  adjacentTips: number[]; // 隣接する指先インデックス
+}
+
+const FINGER_KINEMATICS: Record<number, FingerKinematics> = {
+  4: { tipIndex: 4, dipIndex: 3, pipIndex: 2, boneRatio: 0.85, adjacentTips: [8] },
+  8: { tipIndex: 8, dipIndex: 7, pipIndex: 6, boneRatio: 0.80, adjacentTips: [4, 12] },
+  12: { tipIndex: 12, dipIndex: 11, pipIndex: 10, boneRatio: 0.80, adjacentTips: [8, 16] },
+  16: { tipIndex: 16, dipIndex: 15, pipIndex: 14, boneRatio: 0.80, adjacentTips: [12, 20] },
+  20: { tipIndex: 20, dipIndex: 19, pipIndex: 18, boneRatio: 0.80, adjacentTips: [16] },
+};
+
+// 接地インパクトロック管理（打鍵成立瞬間から40ms間、ターゲット指の座標を固定）
+interface ImpactLockState {
+  hand: 'Left' | 'Right';
+  tipIndex: number;
+  pos: { x: number; y: number; z: number };
+  expiresAt: number;
+}
+let impactLock: ImpactLockState | null = null;
 
 // 英語指名マッピング定数
 const FINGER_ENGLISH_NAMES: Record<number, string> = {
@@ -53,6 +83,33 @@ function formatTargetFingerLabel(target: TargetFinger, note: { pitch: string }):
 }
 
 /**
+ * 現在の音符から、同じターゲット指が連続して何回打鍵されるか（残り回数）を算出
+ * 1回: 水色 / 2回: 緑 / 3回以上: 黄色
+ */
+function getConsecutiveTapCount(): number {
+  const currentIdx = sequencer.getCurrentIndex();
+  const total = sequencer.getTotalNotes();
+  let count = 1;
+
+  for (let i = currentIdx + 1; i < total; i++) {
+    const note = sequencer.getNoteAt(i);
+    if (!note) break;
+    const nextTarget = RIGHT_HAND_FIXED_FINGERS[note.pitch] ?? positionManager.assignTargetFinger(note);
+    if (
+      nextTarget &&
+      nextTarget.handedness === currentTarget.handedness &&
+      nextTarget.tipIndex === currentTarget.tipIndex
+    ) {
+      count++;
+    } else {
+      break;
+    }
+  }
+
+  return count;
+}
+
+/**
  * 演奏シーケンス進行UIの更新 (進捗・現在指定指・次回予告指)
  */
 function updateSequenceUI(): void {
@@ -66,12 +123,22 @@ function updateSequenceUI(): void {
   seqTargetFinger.textContent = formatTargetFingerLabel(currentTarget, currentNote);
 
   const nextNote = sequencer.getNextNote();
+  let nextTarget: TargetFinger | null = null;
   if (nextNote) {
-    const nextTarget = RIGHT_HAND_FIXED_FINGERS[nextNote.pitch] ?? currentTarget;
+    nextTarget = RIGHT_HAND_FIXED_FINGERS[nextNote.pitch] ?? currentTarget;
     seqNextFinger.textContent = formatTargetFingerLabel(nextTarget, nextNote);
   } else {
     seqNextFinger.textContent = '-';
   }
+
+  const consecutiveCount = getConsecutiveTapCount();
+
+  // ホログラムマネージャーへターゲット指情報および連続打鍵回数を同期 (1回: 水色, 2回: 緑, 3回以上: 黄色)
+  hologramEffect.setTargets(
+    { fingerId: currentTarget.tipIndex, hand: currentTarget.handedness },
+    nextTarget ? { fingerId: nextTarget.tipIndex, hand: nextTarget.handedness } : null,
+    consecutiveCount
+  );
 }
 
 // 係数 K スライダーの動的バインド
@@ -90,15 +157,6 @@ if (kSlider && kLabel) {
 let currentTarget: TargetFinger = positionManager.assignTargetFinger(sequencer.getCurrentNote());
 updateSequenceUI();
 
-// 打鍵波紋エフェクト情報
-interface VisualTapRipple {
-  x: number; // 正規化座標 (0 ~ 1)
-  y: number;
-  startTime: number;
-  duration: number;
-  velocity: number;
-}
-const activeRipples: VisualTapRipple[] = [];
 
 // 直近の打鍵時刻を保持（指先フラッシュ表示用）
 const recentTapMap = new Map<string, number>();
@@ -204,6 +262,7 @@ async function startCamera() {
     tracker.resetCalibration();
     tracker.setPlaying(false);
     lastDetectedSlots.clear();
+    impactLock = null;
 
     lastTimestamp = -1;
     startTrackingLoop();
@@ -285,6 +344,9 @@ function startTrackingLoop() {
       // 高速追従平滑化座標および打鍵検知
       const smoothedHands = processHandsAndDetectTaps(rawHands, now);
 
+      // ホログラム演出のアニメーション状態更新
+      hologramEffect.update(now);
+
       // Canvasにターゲットのみ強調描画（テキストUIは完全非表示）
       renderTracking(smoothedHands, now);
 
@@ -330,29 +392,117 @@ function updateDebugGateUI() {
 
 /**
  * 指先座標を平滑化し、打鍵を検知
- * 左手・右手それぞれの打鍵不発を防ぐため、指定指に加えて同手の主要指もフォールバック監視
+ * 骨格幾何学（Kinematic Reconstruction）により机面接地時の隣指吸着・オクルージョンを完全排除
  */
 function processHandsAndDetectTaps(hands: HandData[], timestamp: number): HandData[] {
   let noteTriggeredInThisFrame = false;
 
   return hands.map((hand) => {
-    // HandTrackerの手首ID固定追跡（初期キャリブレーション＋手首間ユークリッド距離マッチング）による安定した左右スロットを使用
+    // HandTrackerの手首ID固定追跡による安定した左右スロットを使用
     const resolvedHandedness: 'Left' | 'Right' = hand.handedness === 'Left' ? 'Left' : 'Right';
     const isTargetHand = resolvedHandedness === currentTarget.handedness;
 
-    // 1. 同手全指先の座標を平滑化
+    // 手のひらの基準スケール（手首 0 と 中指付け根 9 のユークリッド距離）
+    const wristPt = hand.allLandmarks[0];
+    const middleMcpPt = hand.allLandmarks[9];
+    const palmScale =
+      wristPt && middleMcpPt
+        ? Math.hypot(wristPt.x - middleMcpPt.x, wristPt.y - middleMcpPt.y)
+        : 0.15;
+    const proximityThreshold = Math.max(0.020, palmScale * 0.18);
+
+    // 生ランドマーク配列（各指のPIP, DIP, TIP等の関節座標を直接参照）
+    const rawLandmarks = hand.allLandmarks;
+
+    // 1. 同手全指先の座標を骨格復元および平滑化
     const smoothedFingertips: FingertipCoord[] = hand.fingertips.map((tip) => {
       const key = `${resolvedHandedness}_${tip.tipIndex}`;
+      const isTarget = isTargetHand && tip.tipIndex === currentTarget.tipIndex;
+      const kinCfg = FINGER_KINEMATICS[tip.tipIndex];
 
-      // 各指先ごとの独立した 1 Euro Filter 3D インスタンス
+      // 各指先ごとの独立した 1 Euro Filter 3D インスタンス (beta: 1.5 で衝突時ノイズ遮断)
       let filter = filterMap.get(key);
       if (!filter) {
-        filter = new OneEuroFilter3D({ minCutoff: 0.8, beta: 4.0, dCutoff: 1.0 });
+        filter = new OneEuroFilter3D({ minCutoff: 0.8, beta: 1.5, dCutoff: 1.0 });
         filterMap.set(key, filter);
       }
 
-      // 座標平滑化 (急な振り下ろしにも遅延なく追従)
-      const smoothed = filter.filter({ x: tip.x, y: tip.y, z: tip.z }, timestamp);
+      let inputX = tip.x;
+      let inputY = tip.y;
+      let inputZ = tip.z;
+
+      // -------------------------------------------------------------
+      // 【骨格幾何学チェック & フォワード・キネマティクス復元】
+      // 机面接地で指先を見失っても、空中の健全な関節（PIP → DIP）から真の指先位置を再計算
+      // -------------------------------------------------------------
+      if (kinCfg && rawLandmarks[kinCfg.pipIndex] && rawLandmarks[kinCfg.dipIndex]) {
+        const pip = rawLandmarks[kinCfg.pipIndex];
+        const dip = rawLandmarks[kinCfg.dipIndex];
+
+        // 手前の健全な骨ベクトル (PIP -> DIP)
+        const vBoneX = dip.x - pip.x;
+        const vBoneY = dip.y - pip.y;
+        const lenBone = Math.hypot(vBoneX, vBoneY);
+
+        // 指先ベクトル (DIP -> MediaPipe生TIP)
+        const vTipX = inputX - dip.x;
+        const vTipY = inputY - dip.y;
+        const lenTip = Math.hypot(vTipX, vTipY);
+
+        if (lenBone > 0.005 && lenTip > 0.001) {
+          // コサイン類似度（骨の向きと指先の向きの成す角）
+          const cosTheta = (vBoneX * vTipX + vBoneY * vTipY) / (lenBone * lenTip);
+
+          // ターゲット指限定: 隣接指のTIP先端との異常接近判定
+          let isSnappingToNeighbor = false;
+          if (isTarget) {
+            for (const adjIdx of kinCfg.adjacentTips) {
+              const neighborTip = rawLandmarks[adjIdx];
+              if (neighborTip) {
+                const distToNeighbor = Math.hypot(inputX - neighborTip.x, inputY - neighborTip.y);
+                if (distToNeighbor < proximityThreshold) {
+                  isSnappingToNeighbor = true;
+                  break;
+                }
+              }
+            }
+          }
+
+          // 異常判定（隣指吸着、または角度の異常折れ曲がり cosTheta < 0.60、または極端な骨長異常）
+          const isAngleDeviated = cosTheta < 0.60;
+          const isLengthDistorted = lenTip / lenBone > 1.6 || lenTip / lenBone < 0.35;
+
+          if (isSnappingToNeighbor || isAngleDeviated || isLengthDistorted) {
+            // ★幾何学的復元（Kinematic Reconstruction）★
+            // 空中の安定した骨の向き（PIP -> DIP）の延長線上に、正常な骨長比率で指先を再配置
+            const uX = vBoneX / lenBone;
+            const uY = vBoneY / lenBone;
+            const expectedLen = lenBone * kinCfg.boneRatio;
+
+            inputX = dip.x + uX * expectedLen;
+            inputY = dip.y + uY * expectedLen;
+            inputZ = dip.z + (dip.z - pip.z) * kinCfg.boneRatio;
+          }
+        }
+      }
+
+      // 1 Euro Filter 3D による平滑化
+      let smoothed = filter.filter({ x: inputX, y: inputY, z: inputZ }, timestamp);
+
+      // 接地インパクト時の短尺座標ロック (40ms: 打鍵成立瞬間の座標に完全固定)
+      if (
+        impactLock &&
+        impactLock.hand === resolvedHandedness &&
+        impactLock.tipIndex === tip.tipIndex &&
+        timestamp < impactLock.expiresAt
+      ) {
+        smoothed = {
+          x: impactLock.pos.x,
+          y: impactLock.pos.y,
+          z: impactLock.pos.z,
+        };
+      }
+
       return {
         tipIndex: tip.tipIndex,
         name: tip.name,
@@ -365,12 +515,17 @@ function processHandsAndDetectTaps(hands: HandData[], timestamp: number): HandDa
     // 2. 打鍵判定エンジンに同手全指の座標を同期（他指との相対速度比較のため全指の速度を一括更新）
     tapDetector.updateHandFingertips(resolvedHandedness, smoothedFingertips, timestamp);
 
-    // 3. 演奏中かつ右手の打鍵判定（右手単独テスト）
+    // 3. 演奏中かつ右手の打鍵判定（ターゲット指1本のみに限定）
     for (const tip of smoothedFingertips) {
-      const key = `${resolvedHandedness}_${tip.tipIndex}`;
       const isTargetFinger = isTargetHand && tip.tipIndex === currentTarget.tipIndex;
 
-      // 右手単独演奏テスト: 右手の指について打鍵判定（共連れ判定ログ記録も含む）
+      // ターゲット以外の指は打鍵判定を完全にスキップ（誤爆・他指吸着防止）
+      if (!isTargetFinger) {
+        continue;
+      }
+
+      const key = `${resolvedHandedness}_${tip.tipIndex}`;
+
       const canEvaluateTap =
         isPlaying &&
         !noteTriggeredInThisFrame &&
@@ -388,8 +543,16 @@ function processHandsAndDetectTaps(hands: HandData[], timestamp: number): HandDa
         );
 
         // 指定されたターゲット指で正しく打鍵（PASS）された場合のみ発音・進行
-        if (tapEvent && isTargetFinger) {
+        if (tapEvent) {
           noteTriggeredInThisFrame = true;
+
+          // 接地インパクトロック（40ms間、この瞬間の座標に固定）
+          impactLock = {
+            hand: resolvedHandedness,
+            tipIndex: tip.tipIndex,
+            pos: { x: tip.x, y: tip.y, z: tip.z },
+            expiresAt: timestamp + 40,
+          };
 
           // 現在の音符を即座に発音
           const currentNote = sequencer.getCurrentNote();
@@ -404,14 +567,8 @@ function processHandsAndDetectTaps(hands: HandData[], timestamp: number): HandDa
             `♪ ${currentNote.solfege}(${currentNote.pitch}, ${currentNote.frequency.toFixed(1)}Hz)`
           );
 
-          // 打鍵波紋エフェクト
-          activeRipples.push({
-            x: tip.x,
-            y: tip.y,
-            startTime: timestamp,
-            duration: 260,
-            velocity: tapEvent.velocity,
-          });
+          // ホログラムマネージャーへ打鍵イベントを通知
+          hologramEffect.triggerTap(tip.tipIndex, { x: tip.x, y: tip.y });
 
           // 打鍵直後フラッシュ用タイムスタンプ記憶
           recentTapMap.set(key, timestamp);
@@ -428,10 +585,20 @@ function processHandsAndDetectTaps(hands: HandData[], timestamp: number): HandDa
       }
     }
 
+    // Layer 5: 描画パイプラインへの平滑化座標同期
+    // allLandmarks の指先ランドマーク（4, 8, 12, 16, 20）を平滑化・クランプ後座標で上書き
+    const updatedAllLandmarks = hand.allLandmarks.map((lm) => ({ ...lm }));
+    smoothedFingertips.forEach((tip) => {
+      if (updatedAllLandmarks[tip.tipIndex]) {
+        updatedAllLandmarks[tip.tipIndex] = { x: tip.x, y: tip.y, z: tip.z };
+      }
+    });
+
     return {
       ...hand,
       handedness: resolvedHandedness,
       fingertips: smoothedFingertips,
+      allLandmarks: updatedAllLandmarks,
     };
   });
 }
@@ -443,92 +610,44 @@ function processHandsAndDetectTaps(hands: HandData[], timestamp: number): HandDa
 function renderTracking(hands: HandData[], currentTimestamp: number) {
   canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
 
+  // 各手のランドマークマップを生成しホログラム演出（水色/緑/黄色マーカー＆空中アーチ）を描画
+  const landmarksMap = new Map<string, { x: number; y: number }[]>();
+  hands.forEach((hand) => {
+    landmarksMap.set(
+      hand.handedness,
+      hand.allLandmarks.map((lm) => ({ x: lm.x, y: lm.y }))
+    );
+  });
+  hologramEffect.render(canvasCtx, landmarksMap);
+
   const width = canvasElement.width;
   const height = canvasElement.height;
 
-  // 1. 打鍵波紋エフェクトの描画 (白黒・ミニマル)
-  for (let i = activeRipples.length - 1; i >= 0; i--) {
-    const ripple = activeRipples[i];
-    const elapsed = currentTimestamp - ripple.startTime;
-    const progress = elapsed / ripple.duration;
-
-    if (progress >= 1.0) {
-      activeRipples.splice(i, 1);
-      continue;
-    }
-
-    const rx = ripple.x * width;
-    const ry = ripple.y * height;
-    const baseRadius = 10;
-    const maxRadius = 42 + ripple.velocity * 18;
-    const currentRadius = baseRadius + (maxRadius - baseRadius) * Math.sin((progress * Math.PI) / 2);
-    const alpha = (1.0 - progress) * 0.9;
-
-    // 拡散する白い波紋リング
-    canvasCtx.beginPath();
-    canvasCtx.arc(rx, ry, currentRadius, 0, 2 * Math.PI);
-    canvasCtx.strokeStyle = `rgba(255, 255, 255, ${alpha.toFixed(3)})`;
-    canvasCtx.lineWidth = 2.5 * (1.0 - progress * 0.4);
-    canvasCtx.stroke();
-
-    // 内側の微かな光
-    canvasCtx.beginPath();
-    canvasCtx.arc(rx, ry, currentRadius * 0.65, 0, 2 * Math.PI);
-    canvasCtx.fillStyle = `rgba(255, 255, 255, ${(alpha * 0.25).toFixed(3)})`;
-    canvasCtx.fill();
-  }
-
-  // 2. 指先ポイントの描画（対象指のみ白黒二重丸で強調表示、他指は非表示）
+  // ターゲット指のみ打鍵成功フラッシュ（100ms以内）を描画
+  // ※指定されたターゲット指以外へのマーカー表示は一切行わない
   hands.forEach((hand) => {
     hand.fingertips.forEach((tip) => {
-      const px = tip.x * width;
-      const py = tip.y * height;
-
       const isTarget =
         hand.handedness === currentTarget.handedness && tip.tipIndex === currentTarget.tipIndex;
 
-      const key = `${hand.handedness}_${tip.tipIndex}`;
-      const lastTapTime = recentTapMap.get(key) ?? -9999;
-      const isRecentlyTapped = currentTimestamp - lastTapTime < 120;
-
       if (isTarget) {
+        const key = `${hand.handedness}_${tip.tipIndex}`;
+        const lastTapTime = recentTapMap.get(key) ?? -9999;
+        const isRecentlyTapped = currentTimestamp - lastTapTime < 100;
+
         if (isRecentlyTapped) {
+          const px = tip.x * width;
+          const py = tip.y * height;
+
           // 打鍵成功瞬間の高輝度白フラッシュ
+          canvasCtx.save();
           canvasCtx.beginPath();
           canvasCtx.arc(px, py, 18, 0, 2 * Math.PI);
           canvasCtx.fillStyle = '#ffffff';
+          canvasCtx.shadowColor = '#ffffff';
+          canvasCtx.shadowBlur = 15;
           canvasCtx.fill();
-          canvasCtx.lineWidth = 3;
-          canvasCtx.strokeStyle = '#000000';
-          canvasCtx.stroke();
-        } else {
-          // 外側の黒枠白ターゲットリング
-          canvasCtx.beginPath();
-          canvasCtx.arc(px, py, 16, 0, 2 * Math.PI);
-          canvasCtx.lineWidth = 3;
-          canvasCtx.strokeStyle = '#000000';
-          canvasCtx.stroke();
-
-          canvasCtx.beginPath();
-          canvasCtx.arc(px, py, 16, 0, 2 * Math.PI);
-          canvasCtx.lineWidth = 1.8;
-          canvasCtx.strokeStyle = '#ffffff';
-          canvasCtx.stroke();
-
-          // 内側の白丸
-          canvasCtx.beginPath();
-          canvasCtx.arc(px, py, 7, 0, 2 * Math.PI);
-          canvasCtx.fillStyle = '#ffffff';
-          canvasCtx.fill();
-          canvasCtx.lineWidth = 2;
-          canvasCtx.strokeStyle = '#000000';
-          canvasCtx.stroke();
-
-          // 中心黒ドット
-          canvasCtx.beginPath();
-          canvasCtx.arc(px, py, 2, 0, 2 * Math.PI);
-          canvasCtx.fillStyle = '#000000';
-          canvasCtx.fill();
+          canvasCtx.restore();
         }
       }
     });
