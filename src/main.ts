@@ -16,6 +16,7 @@ const countdownBtn = document.getElementById('countdown-btn') as HTMLButtonEleme
 const countdownDisplay = document.getElementById('countdown-display') as HTMLElement;
 
 // デバッグUI 要素
+const debugGatePanel = document.getElementById('debug-gate-panel') as HTMLElement | null;
 const kSlider = document.getElementById('k-slider') as HTMLInputElement;
 const kLabel = document.getElementById('debug-k-label') as HTMLElement;
 const debugTargetFinger = document.getElementById('debug-target-finger') as HTMLElement;
@@ -152,6 +153,22 @@ if (kSlider && kLabel) {
     kLabel.textContent = `K: ${val.toFixed(1)}`;
   });
 }
+
+// UIパネルのキーボードショートカット ('D': デバッグパネル切替, 'U': 進行パネル切替)
+const seqPanel = document.getElementById('sequence-panel');
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'd' || e.key === 'D') {
+    if (debugGatePanel) {
+      const isHidden = getComputedStyle(debugGatePanel).display === 'none';
+      debugGatePanel.style.display = isHidden ? 'block' : 'none';
+    }
+  } else if (e.key === 'u' || e.key === 'U') {
+    if (seqPanel) {
+      const isHidden = getComputedStyle(seqPanel).display === 'none';
+      seqPanel.style.display = isHidden ? 'block' : 'none';
+    }
+  }
+});
 
 // 仮想ポジション管理により動的に決定される現在の打鍵監視対象指 (右手限定メリーさんの羊)
 let currentTarget: TargetFinger = positionManager.assignTargetFinger(sequencer.getCurrentNote());
@@ -365,6 +382,7 @@ function startTrackingLoop() {
  * 相対速度ガード デバッグ情報のリアルタイム更新
  */
 function updateDebugGateUI() {
+  if (!debugGatePanel || getComputedStyle(debugGatePanel).display === 'none') return;
   if (!debugTargetFinger) return;
 
   const currentNote = sequencer.getCurrentNote();
@@ -567,10 +585,17 @@ function processHandsAndDetectTaps(hands: HandData[], timestamp: number): HandDa
             `♪ ${currentNote.solfege}(${currentNote.pitch}, ${currentNote.frequency.toFixed(1)}Hz)`
           );
 
-          // ホログラムマネージャーへ打鍵イベントを通知
-          hologramEffect.triggerTap(tip.tipIndex, { x: tip.x, y: tip.y });
+          // ホログラムマネージャーへ打鍵イベントを通知（ベロシティ・実ピクセル座標連動）
+          const px = tip.x * canvasElement.width;
+          const py = tip.y * canvasElement.height;
+          hologramEffect.triggerTap(
+            tip.tipIndex,
+            { x: tip.x, y: tip.y },
+            tapEvent.velocity,
+            { x: px, y: py }
+          );
 
-          // 打鍵直後フラッシュ用タイムスタンプ記憶
+          // 打鍵直後タイムスタンプ記憶
           recentTapMap.set(key, timestamp);
 
           // シーケンサーを1音前進
@@ -604,13 +629,13 @@ function processHandsAndDetectTaps(hands: HandData[], timestamp: number): HandDa
 }
 
 /**
- * Canvas描画: targetFinger のみを白黒丸マークで強調表示し、打鍵時に波紋フィードバック
- * テキストUIは一切描画せず、純粋な視覚フィードバックのみを提供
+ * Canvas描画: ホログラムエフェクトマネージャーに一元委譲
+ * （ターゲットリング・空中アーチ・打鍵ネオンショックウェーブ・スターダスト粒子・コア閃光）
  */
-function renderTracking(hands: HandData[], currentTimestamp: number) {
+function renderTracking(hands: HandData[], _currentTimestamp: number) {
   canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
 
-  // 各手のランドマークマップを生成しホログラム演出（水色/緑/黄色マーカー＆空中アーチ）を描画
+  // 各手のランドマークマップを生成しホログラム演出を一括描画
   const landmarksMap = new Map<string, { x: number; y: number }[]>();
   hands.forEach((hand) => {
     landmarksMap.set(
@@ -619,41 +644,6 @@ function renderTracking(hands: HandData[], currentTimestamp: number) {
     );
   });
   hologramEffect.render(canvasCtx, landmarksMap);
-
-  const width = canvasElement.width;
-  const height = canvasElement.height;
-
-  // ターゲット指のみ打鍵成功フラッシュ（100ms以内）を描画
-  // ※指定されたターゲット指以外へのマーカー表示は一切行わない
-  hands.forEach((hand) => {
-    hand.fingertips.forEach((tip) => {
-      const isTarget =
-        hand.handedness === currentTarget.handedness && tip.tipIndex === currentTarget.tipIndex;
-
-      if (isTarget) {
-        const key = `${hand.handedness}_${tip.tipIndex}`;
-        const lastTapTime = recentTapMap.get(key) ?? -9999;
-        const isRecentlyTapped = currentTimestamp - lastTapTime < 100;
-
-        if (isRecentlyTapped) {
-          const px = tip.x * width;
-          const py = tip.y * height;
-
-          // 打鍵成功瞬間の高輝度白フラッシュ
-          canvasCtx.save();
-          canvasCtx.beginPath();
-          canvasCtx.arc(px, py, 18, 0, 2 * Math.PI);
-          canvasCtx.fillStyle = '#ffffff';
-          canvasCtx.shadowColor = '#ffffff';
-          canvasCtx.shadowBlur = 15;
-          canvasCtx.fill();
-          canvasCtx.restore();
-        }
-      }
-    });
-  });
-
-  // テキストUIは完全削除（renderTargetHUDなし）
 }
 
 // イベントリスナー

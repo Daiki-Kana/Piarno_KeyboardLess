@@ -137,6 +137,7 @@ html, body {
 
 /* 相対速度ガード デバッグパネル (白黒ミニマル) */
 .debug-panel {
+  display: none;
   position: absolute;
   top: 14px;
   right: 14px;
@@ -256,6 +257,7 @@ html, body {
 
 /* 演奏シーケンス進行パネル (画面左上・白黒ミニマル) */
 .sequence-panel {
+  display: none;
   position: absolute;
   top: 14px;
   left: 14px;

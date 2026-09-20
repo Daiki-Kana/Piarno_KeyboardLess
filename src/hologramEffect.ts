@@ -68,52 +68,55 @@ export const HOLOGRAM_STYLES = {
 } as const;
 
 /**
- * 接地感演出（影風コンタクトドット）のスタイル定義
+ * 打鍵ホログラムエフェクト（ショックウェーブ波紋＋スターダスト粒子＋インパクト閃光）のスタイル定義
  */
-export const CONTACT_DOT_STYLE = {
-  // 描画モード: 'neon' (視認性重視のネオン発光) または 'shadow' (濃いグレー〜黒の接地影風)
-  MODE: 'neon' as 'neon' | 'shadow',
+export const TAP_EFFECT_STYLE = {
+  // 全体継続時間 (ms)
+  DURATION_MS: 320,
 
-  // 寿命（打鍵リズムを邪魔しない短尺: 100〜140ms）
-  DURATION_MS: 120,
+  // コア閃光フラッシュ持続時間 (ms)
+  FLASH_DURATION_MS: 75,
 
-  // ポップアニメーション時間（0〜30ms）
-  POP_TIME_MS: 30,
+  // 最大波紋半径基準 (px)
+  BASE_RIPPLE_RADIUS: 48,
 
-  // 初期スケール（出現直後）
-  INITIAL_SCALE: 0.3,
+  // パーティクル飛散数
+  PARTICLE_COUNT: 8,
 
-  // ポップピークスケール（わずかなオーバーシュート）
-  PEAK_SCALE: 1.08,
-
-  // 安定時スケール（30ms以降）
-  STEADY_SCALE: 1.0,
-
-  // 接地点最大半径 (px: 7〜10pxの極小サイズ)
-  MAX_RADIUS_PX: 8.5,
-
-  // 内側コア円半径 (px)
-  INNER_RADIUS_PX: 3.5,
-
-  // 接地影風モード時の色彩定義
-  SHADOW_OUTER_COLOR: 'rgba(0, 0, 0, 0.6)',
-  SHADOW_INNER_COLOR: 'rgba(0, 0, 0, 0.85)',
-  SHADOW_STROKE_COLOR: 'rgba(20, 20, 20, 0.9)',
-
-  // ネオンモード時の微小シャドウブラー (px)
-  NEON_SHADOW_BLUR: 4,
+  // 発光グローブラー (px)
+  GLOW_BLUR: 15,
 } as const;
 
 /**
- * 接地ドット（ContactDot）情報
+ * 打鍵時に弾け飛ぶ光の微粒子（スターダスト）
  */
-export interface ContactDot {
+export interface TapParticle {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  size: number;
+  color: string;
+  glowColor: string;
+}
+
+/**
+ * 打鍵インパクトエフェクト情報
+ */
+export interface TapImpactEffect {
   fingerId: number;
-  position: Point2D;
+  position: Point2D; // 正規化座標
+  pixelPos?: Point2D; // 初期生成時の実ピクセル座標
   startTime: number;
   duration: number;
+  velocity: number;
   consecutiveCount: number;
+  particles: TapParticle[];
 }
+
+// 後方互換用エイリアス
+export type ContactDot = TapImpactEffect;
+export const CONTACT_DOT_STYLE = TAP_EFFECT_STYLE;
 
 /**
  * ARホログラムエフェクトマネージャー
@@ -123,7 +126,7 @@ export class HologramEffectManager {
   private nextTarget: TargetFingerInfo | null = null;
   private consecutiveCount: number = 1;
   private lastTimestamp: number = 0;
-  private contactDots: ContactDot[] = [];
+  private tapEffects: TapImpactEffect[] = [];
 
   /**
    * 現在および次のターゲット指、および現在の連続打鍵数を指定
@@ -142,18 +145,34 @@ export class HologramEffectManager {
   }
 
   /**
-   * 打鍵イベントを受信し、指先直下に小さな接地ドット（ContactDot）を生成
+   * 打鍵イベントを受信し、指先接地点にネオンショックウェーブ＆飛沫パーティクルを生成
    * @param fingerId 打鍵された指番号
    * @param position 指先の正規化座標 (x: 0~1, y: 0~1)
+   * @param velocity 打鍵の強さ（相対速度・ベロシティ）
+   * @param pixelPos 実ピクセル座標（オプション）
    */
-  public triggerTap(fingerId: number, position: Point2D): void {
-    this.contactDots.push({
+  public triggerTap(
+    fingerId: number,
+    position: Point2D,
+    velocity: number = 1.0,
+    pixelPos?: Point2D
+  ): void {
+    const effect: TapImpactEffect = {
       fingerId,
       position,
+      pixelPos,
       startTime: this.lastTimestamp,
-      duration: CONTACT_DOT_STYLE.DURATION_MS,
+      duration: TAP_EFFECT_STYLE.DURATION_MS,
+      velocity: Math.max(0.6, velocity),
       consecutiveCount: this.consecutiveCount,
-    });
+      particles: [],
+    };
+
+    if (pixelPos) {
+      this.initParticles(effect, pixelPos.x, pixelPos.y);
+    }
+
+    this.tapEffects.push(effect);
   }
 
   /**
@@ -163,11 +182,21 @@ export class HologramEffectManager {
   public update(timestamp: number): void {
     this.lastTimestamp = timestamp;
 
-    // 寿命を迎えたコンタクトドットを安全に除外
-    if (this.contactDots.length > 0) {
-      this.contactDots = this.contactDots.filter(
-        (dot) => timestamp - dot.startTime < dot.duration
+    // 寿命を迎えたエフェクトを除外
+    if (this.tapEffects.length > 0) {
+      this.tapEffects = this.tapEffects.filter(
+        (effect) => timestamp - effect.startTime < effect.duration
       );
+
+      // 飛散パーティクルの位置更新（速度減衰＋わずかな上昇気流）
+      for (const effect of this.tapEffects) {
+        for (const p of effect.particles) {
+          p.x += p.vx;
+          p.y += p.vy;
+          p.vx *= 0.92;
+          p.vy *= 0.92;
+        }
+      }
     }
   }
 
@@ -184,8 +213,8 @@ export class HologramEffectManager {
     const height = ctx.canvas.height;
     if (width === 0 || height === 0) return;
 
-    // 0. 机タップ時の接地感演出（影風コンタクトドット）描画
-    this.renderContactDots(ctx, width, height);
+    // 0. 打鍵時の指先ホログラムエフェクト（ショックウェーブ波紋＋スターダスト＋閃光）描画
+    this.renderTapEffects(ctx, width, height);
 
     if (landmarksMap.size === 0) return;
 
@@ -222,110 +251,144 @@ export class HologramEffectManager {
   }
 
   /**
-   * 机タップ時の接地感演出（影風コンタクトドット）の描画
-   * 外側へ広がる光を排除し、タップした接地点に指の影のような小さな二重丸がポンと現れて素早く消える
+   * 打鍵時に飛散するスターダスト・パーティクルの初期化
    */
-  private renderContactDots(
+  private initParticles(effect: TapImpactEffect, px: number, py: number): void {
+    effect.pixelPos = { x: px, y: py };
+    const count = TAP_EFFECT_STYLE.PARTICLE_COUNT;
+    const velScale = Math.min(1.8, Math.max(0.8, effect.velocity));
+
+    let glowColor = '#00e5ff';
+    let baseColor = 'rgba(0, 229, 255, ';
+    if (effect.consecutiveCount >= 3) {
+      glowColor = '#ffd600';
+      baseColor = 'rgba(255, 214, 0, ';
+    } else if (effect.consecutiveCount === 2) {
+      glowColor = '#00e676';
+      baseColor = 'rgba(0, 230, 118, ';
+    }
+
+    for (let i = 0; i < count; i++) {
+      const angle = (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.5;
+      const speed = (2.2 + Math.random() * 3.4) * velScale;
+      const isWhite = i % 2 === 0;
+
+      effect.particles.push({
+        x: px,
+        y: py,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 0.7,
+        size: 1.8 + Math.random() * 2.2,
+        color: isWhite ? 'rgba(255, 255, 255, 0.95)' : `${baseColor}0.95)`,
+        glowColor: isWhite ? '#ffffff' : glowColor,
+      });
+    }
+  }
+
+  /**
+   * 打鍵ホログラムエフェクト（ショックウェーブ波紋＋パーティクル＋発光閃光）の描画
+   */
+  private renderTapEffects(
     ctx: CanvasRenderingContext2D,
     width: number,
     height: number
   ): void {
-    if (this.contactDots.length === 0) return;
+    if (this.tapEffects.length === 0) return;
 
-    for (const dot of this.contactDots) {
-      const elapsed = this.lastTimestamp - dot.startTime;
-      if (elapsed < 0 || elapsed >= dot.duration) continue;
+    for (const effect of this.tapEffects) {
+      const elapsed = this.lastTimestamp - effect.startTime;
+      if (elapsed < 0 || elapsed >= effect.duration) continue;
 
-      // 1. ポップ & フェードアウト アニメーション計算
-      let scale: number;
-      let alpha: number;
+      const progress = elapsed / effect.duration; // 0.0 ~ 1.0
+      const px = effect.pixelPos ? effect.pixelPos.x : effect.position.x * width;
+      const py = effect.pixelPos ? effect.pixelPos.y : effect.position.y * height;
 
-      if (elapsed <= CONTACT_DOT_STYLE.POP_TIME_MS) {
-        // 出現直後（0〜30ms）: スケールが 0.3 からピーク（1.08）まで素早くポップ
-        const t = elapsed / CONTACT_DOT_STYLE.POP_TIME_MS;
-        const popEase = Math.sin(t * (Math.PI / 2));
-        scale = CONTACT_DOT_STYLE.INITIAL_SCALE +
-          (CONTACT_DOT_STYLE.PEAK_SCALE - CONTACT_DOT_STYLE.INITIAL_SCALE) * popEase;
-        alpha = 1.0;
-      } else {
-        // 残り時間（30〜120ms）: スケールは固定（1.0）のまま不透明度が直線的にフェードアウト
-        const fadeT = (elapsed - CONTACT_DOT_STYLE.POP_TIME_MS) /
-          (dot.duration - CONTACT_DOT_STYLE.POP_TIME_MS);
-        scale = CONTACT_DOT_STYLE.STEADY_SCALE;
-        alpha = Math.max(0, 1.0 - Math.min(1.0, fadeT));
+      // 初回パーティクル生成（未初期化の場合）
+      if (effect.particles.length === 0) {
+        this.initParticles(effect, px, py);
       }
 
-      const px = dot.position.x * width;
-      const py = dot.position.y * height;
-      const outerRadius = CONTACT_DOT_STYLE.MAX_RADIUS_PX * scale;
-      const innerRadius = CONTACT_DOT_STYLE.INNER_RADIUS_PX * scale;
+      // 連続打鍵数に応じたネオンカラー
+      let strokeColor = 'rgba(0, 229, 255, ';
+      let glowColor = '#00e5ff';
+      if (effect.consecutiveCount >= 3) {
+        strokeColor = 'rgba(255, 214, 0, ';
+        glowColor = '#ffd600';
+      } else if (effect.consecutiveCount === 2) {
+        strokeColor = 'rgba(0, 230, 118, ';
+        glowColor = '#00e676';
+      }
+
+      const easeOut = 1 - Math.pow(1 - progress, 3);
+      const velScale = Math.min(1.8, Math.max(0.7, effect.velocity));
+      const ringAlpha = Math.max(0, 1.0 - progress);
 
       ctx.save();
 
-      if (CONTACT_DOT_STYLE.MODE === 'shadow') {
-        // パターン1: 接地影風（濃いグレー〜黒の半透明影）
-        const cFillOuter = `rgba(0, 0, 0, ${(0.55 * alpha).toFixed(3)})`;
-        const cStrokeOuter = `rgba(20, 20, 20, ${(0.8 * alpha).toFixed(3)})`;
-        const cFillInner = `rgba(0, 0, 0, ${(0.85 * alpha).toFixed(3)})`;
+      // 1. コア・インパクト閃光（打鍵直後 0 ~ 75ms）
+      if (elapsed < TAP_EFFECT_STYLE.FLASH_DURATION_MS) {
+        const flashProgress = elapsed / TAP_EFFECT_STYLE.FLASH_DURATION_MS;
+        const flashAlpha = 1.0 - flashProgress;
+        const flashRadius = 14 * (1.0 - flashProgress * 0.3) * velScale;
 
-        // 外側影円
+        // 中心高輝度ホワイト閃光
         ctx.beginPath();
-        ctx.arc(px, py, outerRadius, 0, 2 * Math.PI);
-        ctx.fillStyle = cFillOuter;
+        ctx.arc(px, py, flashRadius, 0, 2 * Math.PI);
+        ctx.fillStyle = `rgba(255, 255, 255, ${(0.95 * flashAlpha).toFixed(3)})`;
+        ctx.shadowColor = '#ffffff';
+        ctx.shadowBlur = 18 * flashAlpha;
         ctx.fill();
-        ctx.lineWidth = 1.0;
-        ctx.strokeStyle = cStrokeOuter;
-        ctx.stroke();
 
-        // 内側コア影
+        // 周囲ネオンハロー
         ctx.beginPath();
-        ctx.arc(px, py, innerRadius, 0, 2 * Math.PI);
-        ctx.fillStyle = cFillInner;
-        ctx.fill();
-      } else {
-        // パターン2: ネオンモード（高輝度ネオン ＋ 微小グロー、連続打鍵数カラー連動）
-        let glowColor: string;
-        let cFillOuter: string;
-        let cStrokeOuter: string;
-        let cFillInner: string;
-
-        if (dot.consecutiveCount >= 3) {
-          // 3回以上: 黄色
-          glowColor = '#ffd600';
-          cFillOuter = `rgba(255, 214, 0, ${(0.35 * alpha).toFixed(3)})`;
-          cStrokeOuter = `rgba(255, 230, 0, ${(0.95 * alpha).toFixed(3)})`;
-          cFillInner = `rgba(255, 245, 120, ${(0.9 * alpha).toFixed(3)})`;
-        } else if (dot.consecutiveCount === 2) {
-          // 2回: 緑
-          glowColor = '#00e676';
-          cFillOuter = `rgba(0, 230, 118, ${(0.35 * alpha).toFixed(3)})`;
-          cStrokeOuter = `rgba(0, 255, 136, ${(0.95 * alpha).toFixed(3)})`;
-          cFillInner = `rgba(130, 255, 190, ${(0.9 * alpha).toFixed(3)})`;
-        } else {
-          // 1回: 水色
-          glowColor = '#00f0ff';
-          cFillOuter = `rgba(0, 229, 255, ${(0.35 * alpha).toFixed(3)})`;
-          cStrokeOuter = `rgba(0, 240, 255, ${(0.95 * alpha).toFixed(3)})`;
-          cFillInner = `rgba(160, 250, 255, ${(0.9 * alpha).toFixed(3)})`;
-        }
-
-        // 微小な接地エッジ発光
+        ctx.arc(px, py, flashRadius * 1.6, 0, 2 * Math.PI);
+        ctx.fillStyle = `${strokeColor}${(0.45 * flashAlpha).toFixed(3)})`;
         ctx.shadowColor = glowColor;
-        ctx.shadowBlur = CONTACT_DOT_STYLE.NEON_SHADOW_BLUR;
-
-        // 1. 接地ドット外側円（内側塗り＋極細輪郭線）
-        ctx.beginPath();
-        ctx.arc(px, py, outerRadius, 0, 2 * Math.PI);
-        ctx.fillStyle = cFillOuter;
+        ctx.shadowBlur = 24 * flashAlpha;
         ctx.fill();
-        ctx.lineWidth = 1.2;
-        ctx.strokeStyle = cStrokeOuter;
-        ctx.stroke();
+      }
 
-        // 2. 接地点コア円
+      // 2. メイン・ショックウェーブリング (外側波紋)
+      const outerRadius = 14 + (TAP_EFFECT_STYLE.BASE_RIPPLE_RADIUS * velScale) * easeOut;
+
+      ctx.beginPath();
+      ctx.arc(px, py, outerRadius, 0, 2 * Math.PI);
+      ctx.lineWidth = Math.max(1.0, 3.2 * (1.0 - progress * 0.65));
+      ctx.strokeStyle = `${strokeColor}${(ringAlpha * 0.95).toFixed(3)})`;
+      ctx.shadowColor = glowColor;
+      ctx.shadowBlur = TAP_EFFECT_STYLE.GLOW_BLUR * ringAlpha;
+      ctx.stroke();
+
+      // 波紋内側の微かな発光面
+      ctx.beginPath();
+      ctx.arc(px, py, outerRadius, 0, 2 * Math.PI);
+      ctx.fillStyle = `${strokeColor}${(ringAlpha * 0.12).toFixed(3)})`;
+      ctx.fill();
+
+      // 3. セカンダリ・追従リング (内側波紋)
+      const innerProgress = Math.max(0, (progress - 0.08) / 0.92);
+      if (innerProgress > 0) {
+        const innerEase = 1 - Math.pow(1 - innerProgress, 2.5);
+        const innerRadius = 8 + (TAP_EFFECT_STYLE.BASE_RIPPLE_RADIUS * 0.62 * velScale) * innerEase;
+        const innerAlpha = Math.max(0, 1.0 - innerProgress);
+
         ctx.beginPath();
         ctx.arc(px, py, innerRadius, 0, 2 * Math.PI);
-        ctx.fillStyle = cFillInner;
+        ctx.lineWidth = Math.max(0.8, 1.8 * (1.0 - innerProgress));
+        ctx.strokeStyle = `rgba(255, 255, 255, ${(innerAlpha * 0.85).toFixed(3)})`;
+        ctx.shadowColor = '#ffffff';
+        ctx.shadowBlur = 8 * innerAlpha;
+        ctx.stroke();
+      }
+
+      // 4. スターダスト・パーティクル（光の飛沫）
+      for (const p of effect.particles) {
+        const pAlpha = ringAlpha;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, Math.max(0.6, p.size * ringAlpha), 0, 2 * Math.PI);
+        ctx.fillStyle = p.color;
+        ctx.shadowColor = p.glowColor;
+        ctx.shadowBlur = 8 * pAlpha;
         ctx.fill();
       }
 
