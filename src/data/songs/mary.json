@@ -1,0 +1,33 @@
+{
+  "id": "mary_had_a_little_lamb",
+  "title": "メリーさんの羊",
+  "hand": "Right",
+  "sequence": [
+    { "finger": 3, "note": "E4" },
+    { "finger": 2, "note": "D4" },
+    { "finger": 1, "note": "C4" },
+    { "finger": 2, "note": "D4" },
+    { "finger": 3, "note": "E4" },
+    { "finger": 3, "note": "E4" },
+    { "finger": 3, "note": "E4" },
+    { "finger": 2, "note": "D4" },
+    { "finger": 2, "note": "D4" },
+    { "finger": 2, "note": "D4" },
+    { "finger": 3, "note": "E4" },
+    { "finger": 5, "note": "G4" },
+    { "finger": 5, "note": "G4" },
+    { "finger": 3, "note": "E4" },
+    { "finger": 2, "note": "D4" },
+    { "finger": 1, "note": "C4" },
+    { "finger": 2, "note": "D4" },
+    { "finger": 3, "note": "E4" },
+    { "finger": 3, "note": "E4" },
+    { "finger": 3, "note": "E4" },
+    { "finger": 3, "note": "E4" },
+    { "finger": 2, "note": "D4" },
+    { "finger": 2, "note": "D4" },
+    { "finger": 3, "note": "E4" },
+    { "finger": 2, "note": "D4" },
+    { "finger": 1, "note": "C4" }
+  ]
+}

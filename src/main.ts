@@ -2,9 +2,11 @@ import { HandTracker, HandData, FingertipCoord } from './handTracker';
 import { OneEuroFilter3D } from './oneEuroFilter';
 import { TapDetector, TapEvent } from './tapDetector';
 import { PianoSynth } from './pianoSynth';
-import { SongSequencer } from './songSequencer';
+import { SongSequencer, NoteInfo } from './songSequencer';
 import { VirtualPositionManager, TargetFinger, RIGHT_HAND_FIXED_FINGERS } from './virtualPositionManager';
 import { HologramEffectManager } from './hologramEffect';
+import marySongData from './data/songs/mary.json';
+import { SongData as JsonSongData, loadSongFromJson, getTargetFingerFromNote } from './types/song';
 
 // DOM 要素
 const videoElement = document.getElementById('webcam') as HTMLVideoElement;
@@ -33,7 +35,9 @@ const seqNextFinger = document.getElementById('seq-next-finger') as HTMLElement;
 const tracker = new HandTracker();
 const tapDetector = new TapDetector();
 const pianoSynth = new PianoSynth();
-const sequencer = new SongSequencer();
+// JSONから楽曲データを読み込んでシーケンサーを初期化
+const loadedSong = loadSongFromJson(marySongData as JsonSongData);
+const sequencer = new SongSequencer(loadedSong);
 const positionManager = new VirtualPositionManager('C4', 'C4');
 const hologramEffect = new HologramEffectManager();
 const filterMap = new Map<string, OneEuroFilter3D>();
@@ -65,6 +69,8 @@ interface ImpactLockState {
   expiresAt: number;
 }
 let impactLock: ImpactLockState | null = null;
+// 打鍵後の連鎖・誤爆防止用グローバルクールダウン（タイムスタンプ ms）
+let globalTapCooldownUntil = 0;
 
 // 英語指名マッピング定数
 const FINGER_ENGLISH_NAMES: Record<number, string> = {
@@ -84,6 +90,16 @@ function formatTargetFingerLabel(target: TargetFinger, note: { pitch: string }):
 }
 
 /**
+ * ノート情報（JSON定義の運指番号 finger または ピッチ）から対応するターゲット指を取得
+ */
+function resolveTargetFinger(note: NoteInfo): TargetFinger {
+  if (note.finger) {
+    return getTargetFingerFromNote({ finger: note.finger as any, hand: note.hand ?? 'Right', note: note.pitch });
+  }
+  return RIGHT_HAND_FIXED_FINGERS[note.pitch] ?? positionManager.assignTargetFinger(note);
+}
+
+/**
  * 現在の音符から、同じターゲット指が連続して何回打鍵されるか（残り回数）を算出
  * 1回: 水色 / 2回: 緑 / 3回以上: 黄色
  */
@@ -95,7 +111,7 @@ function getConsecutiveTapCount(): number {
   for (let i = currentIdx + 1; i < total; i++) {
     const note = sequencer.getNoteAt(i);
     if (!note) break;
-    const nextTarget = RIGHT_HAND_FIXED_FINGERS[note.pitch] ?? positionManager.assignTargetFinger(note);
+    const nextTarget = resolveTargetFinger(note);
     if (
       nextTarget &&
       nextTarget.handedness === currentTarget.handedness &&
@@ -126,7 +142,7 @@ function updateSequenceUI(): void {
   const nextNote = sequencer.getNextNote();
   let nextTarget: TargetFinger | null = null;
   if (nextNote) {
-    nextTarget = RIGHT_HAND_FIXED_FINGERS[nextNote.pitch] ?? currentTarget;
+    nextTarget = resolveTargetFinger(nextNote);
     seqNextFinger.textContent = formatTargetFingerLabel(nextTarget, nextNote);
   } else {
     seqNextFinger.textContent = '-';
@@ -170,8 +186,8 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
-// 仮想ポジション管理により動的に決定される現在の打鍵監視対象指 (右手限定メリーさんの羊)
-let currentTarget: TargetFinger = positionManager.assignTargetFinger(sequencer.getCurrentNote());
+// JSON定義運指データに基づいて決定される現在の打鍵監視対象指
+let currentTarget: TargetFinger = resolveTargetFinger(sequencer.getCurrentNote());
 updateSequenceUI();
 
 
@@ -298,6 +314,16 @@ async function startCamera() {
 async function startCountdown() {
   if (!isCameraRunning || isPlaying) return;
 
+  // ユーザーのスタート操作契機でオーディオコンテキストを確実にアンロック
+  await pianoSynth.ensureContext();
+
+  // オーディオパイプラインの完全覚醒・スピーカー動作確認チャイム (C5: 523.25Hz)
+  try {
+    pianoSynth.playNote(523.25, 0.7);
+  } catch (e) {
+    console.warn('スタート確認音再生エラー:', e);
+  }
+
   countdownBtn.style.display = 'none';
   countdownDisplay.classList.add('show');
 
@@ -406,6 +432,63 @@ function updateDebugGateUI() {
     debugLastResult.textContent = 'WAITING';
     debugLastResult.className = 'debug-value debug-result-waiting';
   }
+}
+
+/**
+ * 打鍵成立時の共通発音・エフェクト・シーケンス前進処理
+ */
+function triggerNoteTap(
+  hand: 'Left' | 'Right',
+  tip: FingertipCoord,
+  tapEvent: TapEvent,
+  timestamp: number
+): void {
+  // 接地インパクトロック（40ms間、この瞬間の座標に固定）
+  impactLock = {
+    hand,
+    tipIndex: tip.tipIndex,
+    pos: { x: tip.x, y: tip.y, z: tip.z },
+    expiresAt: timestamp + 40,
+  };
+
+  // 現在の音符を即座に発音
+  const currentNote = sequencer.getCurrentNote();
+  if (currentNote.chord && currentNote.chord.length > 0) {
+    pianoSynth.playChord(currentNote.chord as number[], tapEvent.velocity);
+  } else {
+    pianoSynth.playNote(currentNote.frequency, tapEvent.velocity);
+  }
+
+  console.log(
+    `[Tap 発音成功] ${hand}手 ${tip.name} -> ` +
+    `♪ ${currentNote.solfege}(${currentNote.pitch}, ${currentNote.frequency.toFixed(1)}Hz)`
+  );
+
+  // ホログラムマネージャーへ打鍵イベントを通知（ベロシティ・実ピクセル座標連動）
+  const px = tip.x * canvasElement.width;
+  const py = tip.y * canvasElement.height;
+  hologramEffect.triggerTap(
+    tip.tipIndex,
+    { x: tip.x, y: tip.y },
+    tapEvent.velocity,
+    { x: px, y: py }
+  );
+
+  // 打鍵直後タイムスタンプ記憶
+  recentTapMap.set(`${hand}_${tip.tipIndex}`, timestamp);
+
+  // 打鍵成立時の全指運動履歴リセットとクールダウン設定（180msの間、次音の誤爆・連鎖を完全遮断）
+  globalTapCooldownUntil = timestamp + 180;
+  tapDetector.resetAfterTap(hand, timestamp);
+
+  // シーケンサーを1音前進
+  const { nextNote } = sequencer.advance();
+
+  // 次のターゲット指を決定 (JSON定義運指ベース)
+  currentTarget = resolveTargetFinger(nextNote);
+
+  // シーケンス進行UIを即座に更新
+  updateSequenceUI();
 }
 
 /**
@@ -530,28 +613,33 @@ function processHandsAndDetectTaps(hands: HandData[], timestamp: number): HandDa
       };
     });
 
+    // 画面内に1手のみ検出されている場合は、手首位置の左右判定の揺れ（画面左寄り等）を吸収し、
+    // 現在のターゲット手（右手）と同一スロットとして扱う
+    const isSingleHand = hands.length === 1;
+    const isEffectiveTargetHand = isTargetHand || (isSingleHand && currentTarget.handedness === 'Right');
+    const effectiveHandedness: 'Left' | 'Right' = (isSingleHand && currentTarget.handedness === 'Right') ? 'Right' : resolvedHandedness;
+
     // 2. 打鍵判定エンジンに同手全指の座標を同期（他指との相対速度比較のため全指の速度を一括更新）
-    tapDetector.updateHandFingertips(resolvedHandedness, smoothedFingertips, timestamp);
+    tapDetector.updateHandFingertips(effectiveHandedness, smoothedFingertips, timestamp);
 
-    // 3. 演奏中かつ右手の打鍵判定（ターゲット指1本のみに限定）
+    // 3. 演奏中かつターゲット手の打鍵判定
+    let matchedTap: { tip: FingertipCoord; event: TapEvent } | null = null;
+    const isUnderGlobalCooldown = timestamp < globalTapCooldownUntil;
+
     for (const tip of smoothedFingertips) {
-      const isTargetFinger = isTargetHand && tip.tipIndex === currentTarget.tipIndex;
-
-      // ターゲット以外の指は打鍵判定を完全にスキップ（誤爆・他指吸着防止）
-      if (!isTargetFinger) {
-        continue;
-      }
-
-      const key = `${resolvedHandedness}_${tip.tipIndex}`;
+      // 指定されたターゲット指のみを厳密に判定（他指の共連れや誤爆を完全排除）
+      const isTargetFinger = isEffectiveTargetHand && tip.tipIndex === currentTarget.tipIndex;
+      if (!isTargetFinger) continue;
 
       const canEvaluateTap =
         isPlaying &&
         !noteTriggeredInThisFrame &&
-        resolvedHandedness === 'Right';
+        !isUnderGlobalCooldown &&
+        (effectiveHandedness === 'Right' || isEffectiveTargetHand);
 
       if (canEvaluateTap) {
         const tapEvent: TapEvent | null = tapDetector.processFingertip(
-          resolvedHandedness,
+          effectiveHandedness,
           tip.tipIndex,
           tip.name,
           tip.x,
@@ -560,54 +648,17 @@ function processHandsAndDetectTaps(hands: HandData[], timestamp: number): HandDa
           timestamp
         );
 
-        // 指定されたターゲット指で正しく打鍵（PASS）された場合のみ発音・進行
         if (tapEvent) {
-          noteTriggeredInThisFrame = true;
-
-          // 接地インパクトロック（40ms間、この瞬間の座標に固定）
-          impactLock = {
-            hand: resolvedHandedness,
-            tipIndex: tip.tipIndex,
-            pos: { x: tip.x, y: tip.y, z: tip.z },
-            expiresAt: timestamp + 40,
-          };
-
-          // 現在の音符を即座に発音
-          const currentNote = sequencer.getCurrentNote();
-          if (currentNote.chord && currentNote.chord.length > 0) {
-            pianoSynth.playChord(currentNote.chord as number[], tapEvent.velocity);
-          } else {
-            pianoSynth.playNote(currentNote.frequency, tapEvent.velocity);
-          }
-
-          console.log(
-            `[Tap 発音成功] ${resolvedHandedness}手 ${tip.name} -> ` +
-            `♪ ${currentNote.solfege}(${currentNote.pitch}, ${currentNote.frequency.toFixed(1)}Hz)`
-          );
-
-          // ホログラムマネージャーへ打鍵イベントを通知（ベロシティ・実ピクセル座標連動）
-          const px = tip.x * canvasElement.width;
-          const py = tip.y * canvasElement.height;
-          hologramEffect.triggerTap(
-            tip.tipIndex,
-            { x: tip.x, y: tip.y },
-            tapEvent.velocity,
-            { x: px, y: py }
-          );
-
-          // 打鍵直後タイムスタンプ記憶
-          recentTapMap.set(key, timestamp);
-
-          // シーケンサーを1音前進
-          const { nextNote } = sequencer.advance();
-
-          // 次のターゲット指を決定 (右手固定ポジション)
-          currentTarget = positionManager.assignTargetFinger(nextNote);
-
-          // シーケンス進行UIを即座に更新
-          updateSequenceUI();
+          matchedTap = { tip, event: tapEvent };
+          break;
         }
       }
+    }
+
+    // ターゲット指打鍵成立時のみ発音・シーケンス進行
+    if (matchedTap) {
+      noteTriggeredInThisFrame = true;
+      triggerNoteTap(effectiveHandedness, matchedTap.tip, matchedTap.event, timestamp);
     }
 
     // Layer 5: 描画パイプラインへの平滑化座標同期
@@ -650,9 +701,25 @@ function renderTracking(hands: HandData[], _currentTimestamp: number) {
 cameraBtn.addEventListener('click', startCamera);
 countdownBtn.addEventListener('click', startCountdown);
 
-// 画面タップでオーディオを確実に再開可能にする
-window.addEventListener('pointerdown', () => {
-  pianoSynth.ensureContext();
+// 画面タップでオーディオを確実に再開（演奏中はタップで現在音のテスト発音も可能）
+window.addEventListener('pointerdown', async (e) => {
+  const target = e.target as HTMLElement | null;
+  if (target?.closest('button') || target?.tagName === 'BUTTON') return;
+  await pianoSynth.ensureContext();
+  if (isPlaying) {
+    const cur = sequencer.getCurrentNote();
+    pianoSynth.playNote(cur.frequency, 0.8);
+  }
+});
+
+// キーボード操作リスナー (Spaceキーでテスト発音)
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' && isPlaying) {
+    e.preventDefault();
+    pianoSynth.ensureContext();
+    const cur = sequencer.getCurrentNote();
+    pianoSynth.playNote(cur.frequency, 0.8);
+  }
 });
 
 // アプリ開始

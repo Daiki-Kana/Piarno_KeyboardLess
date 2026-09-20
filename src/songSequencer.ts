@@ -11,6 +11,7 @@ export interface NoteInfo {
   chord?: readonly number[]; // 和音構成周波数の配列 (Hz) - 左手コード伴奏用
   durationBeats?: number; // 拍数（表示用）
   hand?: 'Left' | 'Right'; // パート種別
+  finger?: number; // ピアノ運指番号 (1: 親指 〜 5: 小指)
 }
 
 export interface SongData {

@@ -2,22 +2,22 @@
  * 指先の垂直方向減速ピークによる机タップ（打鍵）検知エンジン
  */
 
-/** 他指との相対速度比率ガード係数K (Winner-Take-All, デフォルト: 1.4) */
-export const DEFAULT_RELATIVE_VELOCITY_RATIO_K = 1.4;
+/** 他指との相対速度比率ガード係数K (Winner-Take-All, デフォルト: 1.3) */
+export const DEFAULT_RELATIVE_VELOCITY_RATIO_K = 1.3;
 
 /** 1フレームあたりの最大物理許容移動量 (画面高の割合, デフォルト: 0.08 = 8%) */
 export const MAX_PHYSICAL_DISPLACEMENT_PER_FRAME = 0.08;
 
 export interface TapDetectorConfig {
-  /** 能動的振り下ろしとみなす最小垂直速度 (正規化座標/s, デフォルト: 0.45) */
+  /** 能動的振り下ろしとみなす最小垂直速度 (正規化座標/s, デフォルト: 0.25) */
   minDownVelocity?: number;
-  /** 机衝突時の急減速加速度ピーク閾値 (/s², 負値, デフォルト: -14.0) */
+  /** 机衝突時の急減速加速度ピーク閾値 (/s², 負値, デフォルト: -5.5) */
   minDecelPeak?: number;
-  /** 振り下ろし開始から着地インパクトまでの許容時間窓 (ms, デフォルト: 140) */
+  /** 振り下ろし開始から着地インパクトまでの許容時間窓 (ms, デフォルト: 200) */
   maxDownToImpactMs?: number;
-  /** 打鍵後の不応期 (ms, チャタリング防止, デフォルト: 150) */
+  /** 打鍵後の不応期 (ms, チャタリング防止, デフォルト: 180) */
   cooldownMs?: number;
-  /** 他指との相対速度比率K: targetFingerVy > maxOtherVy * K (デフォルト: 1.4) */
+  /** 他指との相対速度比率K: targetFingerVy > maxOtherVy * K (デフォルト: 1.3) */
   relativeVelocityRatio?: number;
   /** 1フレームあたりの最大物理許容垂直移動量 (画面高に対する割合, デフォルト: 0.08) */
   maxDisplacementPerFrame?: number;
@@ -76,10 +76,10 @@ export class TapDetector {
   };
 
   constructor(config: TapDetectorConfig = {}) {
-    this.minDownVelocity = config.minDownVelocity ?? 0.30;
-    this.minDecelPeak = config.minDecelPeak ?? -7.0;
-    this.maxDownToImpactMs = config.maxDownToImpactMs ?? 220;
-    this.cooldownMs = config.cooldownMs ?? 130;
+    this.minDownVelocity = config.minDownVelocity ?? 0.25;
+    this.minDecelPeak = config.minDecelPeak ?? -5.5;
+    this.maxDownToImpactMs = config.maxDownToImpactMs ?? 200;
+    this.cooldownMs = config.cooldownMs ?? 180;
     this.relativeVelocityRatio = config.relativeVelocityRatio ?? DEFAULT_RELATIVE_VELOCITY_RATIO_K;
     this.maxDisplacementPerFrame = config.maxDisplacementPerFrame ?? MAX_PHYSICAL_DISPLACEMENT_PER_FRAME;
   }
@@ -91,6 +91,25 @@ export class TapDetector {
     for (const tipIndex of [4, 8, 12, 16, 20]) {
       const key = `${handedness}_${tipIndex}`;
       this.fingerStates.delete(key);
+    }
+  }
+
+  /**
+   * 打鍵成立直後、その手の全指の運動履歴をリセットしクールダウン状態にする
+   * 打鍵時の手の連動や衝撃の残存による次指の即時誤爆を防止する
+   */
+  resetAfterTap(handedness: 'Left' | 'Right', timestamp: number): void {
+    for (const tipIndex of [4, 8, 12, 16, 20]) {
+      const key = `${handedness}_${tipIndex}`;
+      const state = this.fingerStates.get(key);
+      if (state) {
+        state.lastTapTime = timestamp;
+        state.lastActiveDownTime = -9999;
+        state.maxActiveDownVy = 0;
+        state.currentVy = 0;
+        state.prevVy = 0;
+        state.lastVy = 0;
+      }
     }
   }
 
