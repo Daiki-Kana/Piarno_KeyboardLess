@@ -57,12 +57,12 @@ export class TcnTapDetector {
   private ryHistory: number[] = [];
 
   // リアルタイム調整可能パラメータ（初期値）
-  // 低速押し込み打鍵（実測prob ~0.23）も拾えるよう初期値を0.25に設定
-  private minProb = 0.25;
-  // 手首Y座標による空中キャンセルガード (0.0で無効, デフォルト0.45: 画面下半分)
-  private minWristY = 0.45;
-  // 打鍵深さ（正例統計: ry >= 0.2177）による位置ベースガード
-  private minDepth = 0.15;
+  // 空中誤検知を防ぎつつ机上打鍵を拾う適正値 (0.30)
+  private minProb = 0.30;
+  // 手首Y座標による空中キャンセルガード (0.35: 画面上部〜中央の空中動作を遮断)
+  private minWristY = 0.35;
+  // 打鍵深さ閾値 (0.08: 確実な打鍵押し込みを要求)
+  private minDepth = 0.08;
   // 加速度（減速度）依存を解除するため初期値を 0.0 (OFF) に設定
   private minDecel = 0.0;
   private cooldownMs = 100;
@@ -321,8 +321,12 @@ export class TcnTapDetector {
           const r0 = this.ryHistory[this.ryHistory.length - 3];
           const r1 = this.ryHistory[this.ryHistory.length - 2];
           const r2 = this.ryHistory[this.ryHistory.length - 1];
-          // 直前フレームまで押し込まれており (r1 >= r0)、現在フレームで停止または跳ね返った (r2 <= r1 + 0.035)
-          isPeak = (r1 >= r0 - 0.015) && (r2 <= r1 + 0.035);
+          // 直前フレームまで押し込まれており (r1 >= r0)、現在フレームで停止または跳ね返った
+          isPeak = (r1 >= r0 - 0.02) && (r2 <= r1 + 0.05);
+        }
+        // フォールバック: モデル推論確率が十分高い場合（prob >= 0.35）はモデルが時系列打鍵を直接捉えているためピークとみなす
+        if (!isPeak && prob >= 0.35) {
+          isPeak = true;
         }
 
         // 4. モデル推論確率判定 (低速打鍵での prob ~0.23 も許容)

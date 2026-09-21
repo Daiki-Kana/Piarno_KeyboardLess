@@ -322,51 +322,65 @@ async function startCountdown() {
 
 /**
  * 超低遅延トラッキング描画ループ
+ * requestVideoFrameCallback (rVFC) が利用可能な場合はカメラの物理フレーム更新と完全同期し、
+ * 非対応環境では requestAnimationFrame でフォールバック駆動します。
  */
 function startTrackingLoop() {
-  const loop = () => {
+  const processFrame = (now: number) => {
     if (!isCameraRunning) return;
 
-    const now = performance.now();
-
-    if (videoElement.currentTime !== lastTimestamp) {
-      lastTimestamp = videoElement.currentTime;
-
-      // 解像度変化（端末の回転等）への追従
-      if (
-        videoElement.videoWidth > 0 &&
-        (canvasElement.width !== videoElement.videoWidth ||
-          canvasElement.height !== videoElement.videoHeight)
-      ) {
-        canvasElement.width = videoElement.videoWidth;
-        canvasElement.height = videoElement.videoHeight;
-      }
-
-      // 両手10本の指先トラッキング
-      const rawHands = tracker.detect(videoElement, now);
-
-      // 高速追従平滑化座標の算出 (One Euro Filter 3D)
-      const smoothedHands = smoothHandFingertips(rawHands, now);
-
-      // 平滑化済み特徴量およびカメラ映像・骨格の記録（RECオフ時は即座にリターンしオーバーヘッドなし）
-      featureLogger.processFrame(smoothedHands, now, videoElement);
-
-      // 学習データに基づく 1D-TCN モデル推論による人差し指打鍵検知（平滑化座標 smoothedHands を渡してノイズ排除）
-      if (isCameraRunning) {
-        checkAndTriggerTcnTap(smoothedHands, now);
-      }
-
-      // Canvasにターゲットのみ強調描画（テキストUIは完全非表示）
-      renderTracking(smoothedHands, now);
-
-      // 白黒ミニマル推論デバッグHUDのリアルタイム更新
-      updateDebugHUD();
+    // 解像度変化（端末の回転等）への追従
+    if (
+      videoElement.videoWidth > 0 &&
+      (canvasElement.width !== videoElement.videoWidth ||
+        canvasElement.height !== videoElement.videoHeight)
+    ) {
+      canvasElement.width = videoElement.videoWidth;
+      canvasElement.height = videoElement.videoHeight;
     }
 
-    requestAnimationFrame(loop);
+    // 両手10本の指先トラッキング
+    const rawHands = tracker.detect(videoElement, now);
+
+    // 高速追従平滑化座標の算出 (One Euro Filter 3D: 高beta値による超低遅延追従)
+    const smoothedHands = smoothHandFingertips(rawHands, now);
+
+    // 平滑化済み特徴量およびカメラ映像・骨格の記録（RECオフ時は即座にリターンしオーバーヘッドなし）
+    featureLogger.processFrame(smoothedHands, now, videoElement);
+
+    // 学習データに基づく 1D-TCN モデル推論による人差し指打鍵検知
+    if (isCameraRunning) {
+      checkAndTriggerTcnTap(smoothedHands, now);
+    }
+
+    // Canvasにターゲットのみ強調描画（テキストUIは完全非表示）
+    renderTracking(smoothedHands, now);
+
+    // 白黒ミニマル推論デバッグHUDのリアルタイム更新
+    updateDebugHUD();
   };
 
-  requestAnimationFrame(loop);
+  // requestVideoFrameCallback によるカメラ映像デコード直後のゼロ遅延駆動
+  if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+    const videoCallback = (_now: DOMHighResTimeStamp, _metadata: VideoFrameCallbackMetadata) => {
+      if (!isCameraRunning) return;
+      processFrame(performance.now());
+      videoElement.requestVideoFrameCallback(videoCallback);
+    };
+    videoElement.requestVideoFrameCallback(videoCallback);
+  } else {
+    // rVFC 非対応環境向け RAF ループ
+    const rafLoop = () => {
+      if (!isCameraRunning) return;
+      const now = performance.now();
+      if (videoElement.currentTime !== lastTimestamp) {
+        lastTimestamp = videoElement.currentTime;
+        processFrame(now);
+      }
+      requestAnimationFrame(rafLoop);
+    };
+    requestAnimationFrame(rafLoop);
+  }
 }
 
 /**
@@ -435,14 +449,20 @@ function smoothHandFingertips(
       }
     }
 
-    // 全ランドマークの平滑化 (One Euro Filter 3D)
+    // 全ランドマークの平滑化 (One Euro Filter 3D: 指先は超低遅延高beta設定)
     const smoothedAllLandmarks = hand.allLandmarks.map((pt, idx) => {
       const key = `${resolvedHandedness}_lm_${idx}`;
       let filter = filterMap.get(key);
       if (!filter) {
+        // 人差し指先端(8)は打鍵の瞬間追従が命のため beta=25.0 で遅延を極小化
+        const isTargetTip = idx === 8;
+        const isOtherTip = idx === 4 || idx === 12 || idx === 16 || idx === 20;
+        const minCutoff = isTargetTip ? 1.2 : isOtherTip ? 1.0 : 0.8;
+        const beta = isTargetTip ? 25.0 : isOtherTip ? 18.0 : 10.0;
+
         filter = new OneEuroFilter3D({
-          minCutoff: 0.8,
-          beta: 4.0,
+          minCutoff,
+          beta,
           dCutoff: 1.0,
         });
         filterMap.set(key, filter);
